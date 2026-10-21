@@ -1,0 +1,1536 @@
+diff -ruN a/freebsd/sys/dev/usb/controller/dwc_otg.c b/freebsd/sys/dev/usb/controller/dwc_otg.c
+--- a/freebsd/sys/dev/usb/controller/dwc_otg.c	2026-10-14 10:13:16.407856237 -0700
++++ b/freebsd/sys/dev/usb/controller/dwc_otg.c	2026-10-14 10:13:16.412856258 -0700
+@@ -92,6 +92,565 @@
+ 
+ #ifdef __rtems__
+ #include <rtems/bspIo.h>  /* printk — ISR-safe polled output */
++/*
++ * ===================================================================
++ * RPI_IOC_DEBUG - compile-time switch for ALL Raspberry Pi hang
++ * diagnostics in this file (2026-04 .. 2026-10 hang hunt):
++ *   UART breadcrumb tracer, RAM crash ring at 0x28000000 that survives
++ *   a watchdog reset, GSNPSID write probe, overlap/NAK-holdoff fix
++ *   candidate, FIQ-FSM shadow state, per-channel diag counters and the
++ *   periodic "DWC_OTG t=" console dump, GAHBCFG core-mask helper.
++ * The hang itself was a bug in the RTEMS raspberrypi BSP interrupt
++ * dispatcher (bsps/arm/raspberrypi/irq/irq.c, fixed 2026-10-13), so
++ * none of this is needed for normal operation.  Define RPI_IOC_DEBUG
++ * here (and RPI_IOC_DEBUG=YES in the EPICS app Makefile, which also
++ * links irqwrap.c / fiq_gpio_toggle.c) to get the full instrumentation
++ * back.  What stays in production: the BCM2835 errata workarounds
++ * (AHB-idle wait, 4080-word FIFO cap, GAHBCFG 0x10) and the init
++ * summary line.
++ * ===================================================================
++ */
++/* #define RPI_IOC_DEBUG 1 */
++#ifdef RPI_IOC_DEBUG
++
++
++/*
++ * ---------------------------------------------------------------------
++ * 2026-10-06 AHB-stall tracer ("breadcrumbs").
++ *
++ * The RPi 3B+ hang is a bus stall: the CPU blocks forever on one
++ * peripheral access and nothing (not even a FIQ) runs afterwards.
++ * To find WHICH access, emit one character to the console UART
++ * (polled, no termios, no locks) immediately BEFORE (lower case) and
++ * immediately AFTER (upper case) every "rare" DWC OTG register access.
++ * The last character on the serial line at hang time therefore names
++ * the access that never completed:
++ *
++ *   c<n>/C  HCCHAR(n) write (channel enable / reprogram)
++ *   d<n>/D  HCCHAR(n) write with CHDIS set (channel halt request)
++ *   r<n>/R  HCCHAR(n) read
++ *   t<n>/T  HCTSIZ(n) write        s<n>/S  HCSPLT(n) write
++ *   m<n>/M  HCINTMSK(n) write
++ *   i<n>/I  HCINT(n) read          j<n>/J  HCINT(n) write (W1C)
++ *   p/P     GRXSTSP pop (RX status FIFO read)
++ *   w/W     data FIFO write (bus_space_write_region_4 on DFIFO)
++ *   e/E     data FIFO read  (bus_space_read_region_4 on DFIFO)
++ *   h/H     HPRT write              q/Q     HPRT read
++ *   k/K     GINTMSK write
++ *   x/X     other global/host config register write (init, HFIR, PCGCCTL..)
++ *   y/Y     other global/host config register read
++ *   !       halt requested while the TX request queue reported 0 free
++ *           entries (the Linux dwc2 slave-mode "halt_on_queue" case)
++ *
++ * Frequent per-interrupt accesses (GINTSTS, HFNUM, HAINT, GNPTXSTS,
++ * HPTXSTS) are NOT traced to keep the UART volume at a few hundred
++ * bytes/s. If the trail ends in an UPPER-case letter, the stall is in
++ * one of those (or outside the USB driver).
++ *
++ * Runtime switch: dwc_otg_trace_enable (set to 0 from a debugger /
++ * shell to silence). Compile-time removal: -DDWC_OTG_NO_TRACE.
++ * ---------------------------------------------------------------------
++ */
++volatile int dwc_otg_trace_enable = 0;	/* 2026-10-13: off by default, RAM ring replaces it */
++/* weak default so libbsd test programs link; the EPICS app stub overrides it */
++__attribute__((weak)) volatile uint32_t g_fiq_spsr_fix_count;
++static volatile uint32_t dwc_otg_diag_halt_qfull;  /* '!' events */
++/*
++ * 2026-10-13 FIX candidate state:
++ *  - dwc_otg_halt_req_fn[x]: frame number when CHDIS was issued on ch x
++ *  - overlap_block: allocations deferred because the same endpoint still
++ *    had an IN channel waiting for its halt to complete
++ *  - overlap_timeout: deferrals given up after DWC_OTG_HALT_WAIT_MAX frames
++ */
++#define	DWC_OTG_HALT_WAIT_MAX	64	/* (micro)frames: 8 ms at HS */
++#define	DWC_OTG_NAK_HOLDOFF_HS	8	/* microframes, like Linux nak_holdoff */
++volatile int dwc_otg_fix_enable = 0;	/* 1 = no-overlap + NAK holdoff (did not help 2026-10-13) */
++static uint16_t dwc_otg_halt_req_fn[16];
++static volatile uint32_t dwc_otg_diag_overlap_block;
++static volatile uint32_t dwc_otg_diag_overlap_timeout;
++static volatile uint32_t dwc_otg_diag_nak_holdoff;
++
++static __inline void
++dwc_otg_trace_putc(char c)
++{
++#ifndef DWC_OTG_NO_TRACE
++	if (dwc_otg_trace_enable != 0)
++		(*BSP_output_char)(c);
++#else
++	(void)c;
++#endif
++}
++
++/* classify a register offset; returns 0 for "do not trace" */
++static __inline char
++dwc_otg_trace_class(uint32_t reg, int is_write, uint32_t data, int *chan)
++{
++	*chan = -1;
++	if (reg >= 0x1000)			/* DFIFO windows: handled by region ops */
++		return (0);
++	if (reg >= 0x500 && reg < 0x700) {	/* host channel registers */
++		*chan = (int)((reg - 0x500) >> 5);
++		switch (reg & 0x1c) {
++		case 0x00:	/* HCCHAR */
++			if (!is_write)
++				return ('r');
++			return ((data & HCCHAR_CHDIS) ? 'd' : 'c');
++		case 0x04:	return (is_write ? 's' : 0);	/* HCSPLT */
++		case 0x08:	return (is_write ? 'j' : 'i');	/* HCINT */
++		case 0x0c:	return (is_write ? 'm' : 0);	/* HCINTMSK */
++		case 0x10:	return (is_write ? 't' : 0);	/* HCTSIZ */
++		default:	return (0);
++		}
++	}
++	switch (reg) {
++	case DOTG_GINTSTS:
++	case DOTG_HFNUM:
++	case DOTG_HAINT:
++	case DOTG_HAINTMSK:
++	case DOTG_GNPTXSTS:
++	case DOTG_HPTXSTS:
++	case DOTG_GRXSTSRH:
++		return (0);			/* too frequent / harmless */
++	case DOTG_GRXSTSPH:
++		return (is_write ? 0 : 'p');
++	case DOTG_HPRT:
++		return (is_write ? 'h' : 'q');
++	case DOTG_GINTMSK:
++		return (is_write ? 'k' : 0);
++	default:
++		if (reg >= 0x800 && reg < 0xe00)	/* device-mode registers */
++			return (0);
++		return (is_write ? 'x' : 'y');
++	}
++}
++
++/*
++ * ---------------------------------------------------------------------
++ * 2026-10-13 RAM crash ring ("black box").
++ *
++ * Every DWC OTG register access is recorded in an uncached RAM ring at a
++ * fixed physical address outside the RTEMS memory map (RTEMS uses
++ * 0x00200000..0x10000000). Each entry is written BEFORE the access with
++ * DONE=0, flushed with DSB, then marked DONE after the access returns.
++ * After the bus freeze the BCM2835 PM watchdog (petted by heartbeat.c)
++ * resets the SoC; DRAM keeps its content across that reset, and on the
++ * next boot dwc_otg_init() prints the tail of the old ring before
++ * reusing it. The newest entry with DONE=0 is the access that hung.
++ * ---------------------------------------------------------------------
++ */
++#include <libcpu/arm-cp15.h>
++
++#define	DWC_RING_PHYS		0x28000000u	/* 640 MB, 1 MB section */
++#define	DWC_RING_ENTRIES	16384u		/* 16 B each = 256 KB */
++#define	DWC_RING_DUMP		600u		/* entries printed after reset */
++#define	DWC_RING_MAGIC0		0x44574352u	/* "DWCR" */
++#define	DWC_RING_MAGIC1		0x2026a13bu
++
++#define	DWC_RT_READ		0x1u
++#define	DWC_RT_WRITE		0x2u
++#define	DWC_RT_FIFO_WR		0x3u
++#define	DWC_RT_FIFO_RD		0x4u
++#define	DWC_RT_MARK		0x5u
++#define	DWC_RT_DONE		0x08000000u
++
++struct dwc_ring_entry {
++	uint32_t seq;
++	uint32_t tag;		/* [31:28] type, [27] done, [15:0] reg */
++	uint32_t val;		/* value written / read, or FIFO word count */
++	uint32_t tim;		/* CNTVCT low 32 bits (19.2 MHz) */
++};
++
++struct dwc_ring {
++	uint32_t magic0;
++	uint32_t magic1;
++	uint32_t boot_count;
++	uint32_t check;		/* magic0 ^ magic1 ^ boot_count */
++	uint32_t cnt_freq;
++	uint32_t pad[3];
++	struct dwc_ring_entry e[DWC_RING_ENTRIES];
++};
++
++static struct dwc_ring *dwc_ring;	/* NULL until mapped */
++static uint32_t dwc_ring_seq;
++static struct dwc_otg_softc *dwc_ring_sc;	/* set in dwc_otg_init() */
++/*
++ * 2026-10-13 write probe. The BCM2837 ARM->peripheral bridge acknowledges
++ * writes early (posted), so a write that wedges the DWC OTG AHB slave is
++ * reported "done" to the CPU and only the NEXT peripheral access hangs
++ * (in the 2026-10-13 capture that next access was outside this driver).
++ * With the probe, every register write is followed by a read of GSNPSID
++ * (0x040, side-effect free): a read cannot be acknowledged early, so a
++ * stuck write now shows as "R reg=0x040 *** PENDING" right after it.
++ * It also serializes posted writes, which may by itself be a cure.
++ */
++volatile int dwc_otg_wprobe_enable = 0;	/* 2026-10-13 soak build: off (production timing) */
++/* period of the "DWC_OTG t=" console dump in seconds, 0 = off (iocsh var) */
++volatile int dwc_otg_diag_period = 60;
++#define	DOTG_GSNPSID_OFF	0x040u
++
++static __inline uint32_t
++dwc_ring_now(void)
++{
++	return ((uint32_t)arm_cp15_get_counter_virtual_count());
++}
++
++static __inline struct dwc_ring_entry *
++dwc_ring_begin(uint32_t type, uint32_t reg, uint32_t val)
++{
++	struct dwc_ring_entry *e;
++	uint32_t seq;
++
++	if (dwc_ring == NULL)
++		return (NULL);
++	seq = ++dwc_ring_seq;
++	e = &dwc_ring->e[seq & (DWC_RING_ENTRIES - 1)];
++	e->tag = (type << 28) | (reg & 0xffff);
++	e->val = val;
++	e->tim = dwc_ring_now();
++	e->seq = seq;
++	__asm__ volatile ("dsb" ::: "memory");
++	return (e);
++}
++
++static __inline void
++dwc_ring_end(struct dwc_ring_entry *e, int set_val, uint32_t val)
++{
++	if (e == NULL)
++		return;
++	if (set_val)
++		e->val = val;
++	e->tag |= DWC_RT_DONE;
++	__asm__ volatile ("dsb" ::: "memory");
++}
++
++/* Public: timeline markers from other code (heartbeat, IRQ wrappers). */
++void dwc_otg_ring_mark(uint32_t tag16, uint32_t val);
++void *dwc_otg_ring_mark_begin(uint32_t tag16, uint32_t val);
++void dwc_otg_ring_mark_end(void *handle);
++void dwc_otg_ring_mark_end_val(void *handle, uint32_t val);
++uint32_t dwc_otg_ring_boot_count(void);
++void
++dwc_otg_ring_mark(uint32_t tag16, uint32_t val)
++{
++	struct dwc_ring_entry *e = dwc_ring_begin(DWC_RT_MARK, tag16, val);
++
++	dwc_ring_end(e, 0, 0);
++}
++void *
++dwc_otg_ring_mark_begin(uint32_t tag16, uint32_t val)
++{
++	return (dwc_ring_begin(DWC_RT_MARK, tag16, val));
++}
++void
++dwc_otg_ring_mark_end(void *handle)
++{
++	dwc_ring_end((struct dwc_ring_entry *)handle, 0, 0);
++}
++void
++dwc_otg_ring_mark_end_val(void *handle, uint32_t val)
++{
++	dwc_ring_end((struct dwc_ring_entry *)handle, 1, val);
++}
++/* 0 until the ring is mapped; then 1 for the first boot after power-up. */
++uint32_t
++dwc_otg_ring_boot_count(void)
++{
++	return (dwc_ring != NULL ? dwc_ring->boot_count : 0);
++}
++
++static __inline void
++dwc_otg_wprobe(struct dwc_otg_softc *sc)
++{
++	struct dwc_ring_entry *e;
++	uint32_t v;
++
++	if (dwc_otg_wprobe_enable == 0)
++		return;
++	e = dwc_ring_begin(DWC_RT_READ, DOTG_GSNPSID_OFF, 0);
++	v = bus_space_read_4(sc->sc_io_tag, sc->sc_io_hdl, DOTG_GSNPSID_OFF);
++	dwc_ring_end(e, 1, v);
++}
++
++static void
++dwc_ring_init_and_dump(void)
++{
++	struct dwc_ring *r = (struct dwc_ring *)(uintptr_t)DWC_RING_PHYS;
++	uint32_t i, best, best_seq, start, n, boots, freq;
++
++	/* map 1 MB uncached (Device) section; RTEMS leaves it unmapped */
++	arm_cp15_set_translation_table_entries((const void *)r,
++	    (const void *)((uintptr_t)r + 0x100000u), ARMV7_MMU_DEVICE);
++
++	freq = arm_cp15_get_counter_frequency();
++	if (freq == 0)
++		freq = 19200000u;
++
++	if (r->magic0 == DWC_RING_MAGIC0 && r->magic1 == DWC_RING_MAGIC1 &&
++	    r->check == (r->magic0 ^ r->magic1 ^ r->boot_count)) {
++		boots = r->boot_count;
++		best = 0;
++		best_seq = 0;
++		for (i = 0; i < DWC_RING_ENTRIES; i++) {
++			if (r->e[i].seq > best_seq &&
++			    (r->e[i].seq & (DWC_RING_ENTRIES - 1)) == i) {
++				best_seq = r->e[i].seq;
++				best = i;
++			}
++		}
++		printk("\n===== DWC RING from previous boot #%u: last seq=%u, "
++		    "showing last %u accesses (oldest first) =====\n",
++		    (unsigned)boots, (unsigned)best_seq, DWC_RING_DUMP);
++		printk("legend: R=read W=write FW/FR=FIFO wr/rd (val=words) "
++		    "MK=marker (reg 0x4842=HB n, 0x4945/0x4944=IRQ-ctrl vector "
++		    "enable/disable write, 0x4946/0x4947=IRQ-ctrl PENDING1 "
++		    "read-back after enable/disable (val=pending), "
++		    "0x4943=core-mask mode GAHBCFG, 0x4958=IRQ_BASIC read, "
++		    "0x4950=IRQ_PENDING1/2 read, 0x4948=handler dispatch vector) "
++		    "; -N = timer ticks before last entry "
++		    "(~1 us) ; '*** PENDING' = access never completed\n");
++		n = (best_seq < DWC_RING_DUMP) ? best_seq : DWC_RING_DUMP;
++		start = best_seq - n + 1;
++		for (i = 0; i < n; i++) {
++			uint32_t sq = start + i;
++			struct dwc_ring_entry *e =
++			    &r->e[sq & (DWC_RING_ENTRIES - 1)];
++			uint32_t type = e->tag >> 28;
++			static const char *tn[] =
++			    { "??", "R ", "W ", "FW", "FR", "MK", "??", "??",
++			      "??", "??", "??", "??", "??", "??", "??", "??" };
++			uint32_t dt_us = (uint32_t)(r->e[best].tim - e->tim);
++
++			if (e->seq != sq) {
++				printk("RING %u: (overwritten/garbled)\n",
++				    (unsigned)sq);
++				continue;
++			}
++			printk("RING %u -%u %s reg=0x%03x val=0x%08x%s\n",
++			    (unsigned)sq, (unsigned)dt_us, tn[type & 15],
++			    (unsigned)(e->tag & 0xffff), (unsigned)e->val,
++			    (e->tag & DWC_RT_DONE) ? "" : "   *** PENDING");
++		}
++		printk("===== end of DWC RING dump =====\n\n");
++		boots++;
++	} else {
++		printk("DWC RING: no valid ring from a previous boot "
++		    "(cold power-up or first run)\n");
++		boots = 1;
++	}
++
++	/* reset for this boot */
++	for (i = 0; i < DWC_RING_ENTRIES; i++)
++		r->e[i].seq = 0;
++	r->cnt_freq = freq;
++	r->boot_count = boots;
++	r->magic0 = DWC_RING_MAGIC0;
++	r->magic1 = DWC_RING_MAGIC1;
++	r->check = DWC_RING_MAGIC0 ^ DWC_RING_MAGIC1 ^ boots;
++	__asm__ volatile ("dsb" ::: "memory");
++	dwc_ring_seq = 0;
++	dwc_ring = r;
++	printk("DWC RING: recording to 0x%08x (%u entries), boot #%u\n",
++	    (unsigned)DWC_RING_PHYS, DWC_RING_ENTRIES, (unsigned)boots);
++}
++
++static __inline void
++dwc_otg_trace_begin(char c, int chan)
++{
++	dwc_otg_trace_putc(c);
++	if (chan >= 0)
++		dwc_otg_trace_putc("0123456789abcdef"[chan & 15]);
++}
++
++static __inline uint32_t
++dwc_otg_traced_read_4(struct dwc_otg_softc *sc, uint32_t reg)
++{
++	uint32_t v;
++	int chan;
++	char c = dwc_otg_trace_class(reg, 0, 0, &chan);
++	struct dwc_ring_entry *e = dwc_ring_begin(DWC_RT_READ, reg, 0);
++
++	if (c == 0 || dwc_otg_trace_enable == 0) {
++		v = bus_space_read_4(sc->sc_io_tag, sc->sc_io_hdl, reg);
++		dwc_ring_end(e, 1, v);
++		return (v);
++	}
++	dwc_otg_trace_begin(c, chan);
++	v = bus_space_read_4(sc->sc_io_tag, sc->sc_io_hdl, reg);
++	dwc_ring_end(e, 1, v);
++	dwc_otg_trace_putc((char)(c - 'a' + 'A'));
++	return (v);
++}
++
++static __inline void
++dwc_otg_traced_write_4(struct dwc_otg_softc *sc, uint32_t reg, uint32_t data)
++{
++	int chan;
++	char c = dwc_otg_trace_class(reg, 1, data, &chan);
++	struct dwc_ring_entry *e = dwc_ring_begin(DWC_RT_WRITE, reg, data);
++
++	if (c == 0 || dwc_otg_trace_enable == 0) {
++		bus_space_write_4(sc->sc_io_tag, sc->sc_io_hdl, reg, data);
++		/* DSB so a stalled posted write is not marked DONE early */
++		__asm__ volatile ("dsb" ::: "memory");
++		dwc_ring_end(e, 0, 0);
++		dwc_otg_wprobe(sc);
++		return;
++	}
++	dwc_otg_trace_begin(c, chan);
++	bus_space_write_4(sc->sc_io_tag, sc->sc_io_hdl, reg, data);
++	__asm__ volatile ("dsb" ::: "memory");
++	dwc_ring_end(e, 0, 0);
++	dwc_otg_wprobe(sc);
++	dwc_otg_trace_putc((char)(c - 'a' + 'A'));
++}
++
++static __inline void
++dwc_otg_traced_write_region_4(bus_space_tag_t t, bus_space_handle_t h,
++    bus_size_t off, const uint32_t *buf, bus_size_t cnt)
++{
++	struct dwc_ring_entry *e = dwc_ring_begin(DWC_RT_FIFO_WR, off, cnt);
++
++	dwc_otg_trace_putc('w');
++	bus_space_write_region_4(t, h, off, buf, cnt);
++	__asm__ volatile ("dsb" ::: "memory");
++	dwc_ring_end(e, 0, 0);
++	if (dwc_otg_wprobe_enable != 0) {
++		struct dwc_ring_entry *e2 =
++		    dwc_ring_begin(DWC_RT_READ, DOTG_GSNPSID_OFF, 0);
++		uint32_t v = bus_space_read_4(t, h, DOTG_GSNPSID_OFF);
++		dwc_ring_end(e2, 1, v);
++	}
++	dwc_otg_trace_putc('W');
++}
++
++static __inline void
++dwc_otg_traced_read_region_4(bus_space_tag_t t, bus_space_handle_t h,
++    bus_size_t off, uint32_t *buf, bus_size_t cnt)
++{
++	struct dwc_ring_entry *e = dwc_ring_begin(DWC_RT_FIFO_RD, off, cnt);
++
++	dwc_otg_trace_putc('e');
++	bus_space_read_region_4(t, h, off, buf, cnt);
++	dwc_ring_end(e, 0, 0);
++	dwc_otg_trace_putc('E');
++}
++
++#undef DWC_OTG_READ_4
++#undef DWC_OTG_WRITE_4
++#define	DWC_OTG_READ_4(sc, reg)		dwc_otg_traced_read_4((sc), (reg))
++#define	DWC_OTG_WRITE_4(sc, reg, data)	dwc_otg_traced_write_4((sc), (reg), (data))
++
++/*
++ * 2026-10-13 (third capture): the access that stalls the SoC is the
++ * BCM2835 interrupt-controller ENABLE_IRQS_1 write issued by the RTEMS
++ * interrupt server right after the USB handler (marker 0x4945 PENDING;
++ * every DWC register access before it, including the GSNPSID read-back
++ * of the HCCHAR enable write, had completed).  Experiment: keep the
++ * interrupt-controller bit for the USB vector permanently enabled and
++ * mask/unmask the interrupt in the DWC core itself (GAHBCFG.GlblIntrMsk)
++ * instead.  Called from irqwrap.c (EPICS app) via the --wrap'ed
++ * bsp_interrupt_vector_enable/disable.  Both accesses are ring-logged.
++ * The read-back makes sure the mask took effect (level IRQ line) before
++ * the ISR returns.
++ */
++void dwc_otg_rtems_core_irq(int enable);
++void
++dwc_otg_rtems_core_irq(int enable)
++{
++	struct dwc_otg_softc *sc = dwc_ring_sc;
++
++	if (sc == NULL)
++		return;
++	DWC_OTG_WRITE_4(sc, DOTG_GAHBCFG,
++	    enable ? (GAHBCFG_GLBLINTRMSK | 0x10) : 0x10);
++	(void)DWC_OTG_READ_4(sc, DOTG_GAHBCFG);
++}
++#include <dev/usb/controller/dwc_otg_fiq_state.h>
++__attribute__((weak)) struct dwc_fiq_state *
++dwc_fiq_get_state(void) { return NULL; }
++__attribute__((weak)) uint32_t
++dwc_fiq_log_drain(char *out, uint32_t max_chars)
++{ (void)out; (void)max_chars; return 0; }
++/*
++ * Diagnostic counters for RPi 3B+ hang debugging.
++ * Printed once per second from dwc_otg_timer().
++ * Safe to remove after the hang is resolved.
++ */
++static volatile uint32_t dwc_otg_diag_yield;       /* poll loop hit 16-iter cap */
++static volatile uint32_t dwc_otg_diag_alloc_fail;  /* channel alloc returned busy */
++static volatile uint32_t dwc_otg_diag_halt_ok;     /* halt completions processed */
++static volatile uint32_t dwc_otg_diag_rx_discard;  /* RX data discarded (no active ep) */
++static volatile uint32_t dwc_otg_diag_filt_enter;  /* filter ISR entries */
++static volatile uint32_t dwc_otg_diag_filt_exit;   /* filter ISR exits */
++static volatile uint32_t dwc_otg_diag_thr_enter;   /* thread handler entries */
++static volatile uint32_t dwc_otg_diag_thr_exit;    /* thread handler exits */
++static volatile uint32_t dwc_otg_diag_last_gintsts; /* last GINTSTS seen in filter */
++static volatile uint32_t dwc_otg_diag_in_filter;    /* 1 while filter ISR executing */
++/*
++ * Added 2026-05-23 for hang-signature capture (per Linux FIQ study —
++ * the failure mode is unlikely to be split-transaction timing since
++ * we're HS-only; need to see WHICH GINTSTS bit or channel HCINT is
++ * stuck at the moment the 1Hz timer stops printing).
++ */
++static volatile uint32_t dwc_otg_diag_gintsts_or;   /* bitwise-OR of all GINTSTS seen in filter */
++static volatile uint32_t dwc_otg_diag_sof_count;    /* filter saw GINTSTS_SOFINT */
++static volatile uint32_t dwc_otg_diag_hcint_clears; /* total dwc_otg_clear_hcint calls */
++static volatile uint32_t dwc_otg_diag_hcint_last[16]; /* last HCINT value per channel (W1C-cleared) */
++static volatile uint32_t dwc_otg_diag_hcint_frame[16];/* HFNUM at the time of last HCINT per ch */
++static volatile uint32_t dwc_otg_diag_hcint_count[16];/* clears per channel */
++static volatile uint32_t dwc_otg_diag_hcint_nak[16];  /* HCINT_NAK seen per channel */
++static volatile uint32_t dwc_otg_diag_hcint_xacterr[16]; /* HCINT XACTERR per channel */
++
++/*
++ * Shadow-write helpers: update FIQ shadow state before writing hardware.
++ * Non-RTEMS builds use plain DWC_OTG_WRITE_4 via the #else macros below.
++ */
++static __inline void
++dwc_otg_shadow_write_hcchar(struct dwc_otg_softc *sc, uint8_t ch, uint32_t val)
++{
++	if (sc->sc_fiq != NULL)
++		sc->sc_fiq->channel[ch].hcchar_copy = val;
++	DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(ch), val);
++}
++
++static __inline void
++dwc_otg_shadow_write_hcsplt(struct dwc_otg_softc *sc, uint8_t ch, uint32_t val)
++{
++	if (sc->sc_fiq != NULL)
++		sc->sc_fiq->channel[ch].hcsplt_copy = val;
++	DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(ch), val);
++}
++
++static __inline void
++dwc_otg_shadow_write_hctsiz(struct dwc_otg_softc *sc, uint8_t ch, uint32_t val)
++{
++	if (sc->sc_fiq != NULL)
++		sc->sc_fiq->channel[ch].hctsiz_copy = val;
++	DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(ch), val);
++}
++
++static __inline void
++dwc_otg_shadow_write_hcintmsk(struct dwc_otg_softc *sc, uint8_t ch, uint32_t val)
++{
++	if (sc->sc_fiq != NULL)
++		sc->sc_fiq->channel[ch].hcintmsk_copy = val;
++	DWC_OTG_WRITE_4(sc, DOTG_HCINTMSK(ch), val);
++}
++#else /* !RPI_IOC_DEBUG: production build, no diagnostics */
++#define	dwc_otg_shadow_write_hcchar(sc, ch, val)   DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(ch), val)
++#define	dwc_otg_shadow_write_hcsplt(sc, ch, val)   DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(ch), val)
++#define	dwc_otg_shadow_write_hctsiz(sc, ch, val)   DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(ch), val)
++#define	dwc_otg_shadow_write_hcintmsk(sc, ch, val) DWC_OTG_WRITE_4(sc, DOTG_HCINTMSK(ch), val)
++#define	dwc_otg_traced_write_region_4	bus_space_write_region_4
++#define	dwc_otg_traced_read_region_4	bus_space_read_region_4
++#endif /* RPI_IOC_DEBUG */
++#else
++#define	dwc_otg_shadow_write_hcchar(sc, ch, val)   DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(ch), val)
++#define	dwc_otg_shadow_write_hcsplt(sc, ch, val)   DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(ch), val)
++#define	dwc_otg_shadow_write_hctsiz(sc, ch, val)   DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(ch), val)
++#define	dwc_otg_shadow_write_hcintmsk(sc, ch, val) DWC_OTG_WRITE_4(sc, DOTG_HCINTMSK(ch), val)
++#define	dwc_otg_traced_write_region_4	bus_space_write_region_4
++#define	dwc_otg_traced_read_region_4	bus_space_read_region_4
+ #endif
+ 
+ #define	DWC_OTG_BUS2SC(bus) \
+@@ -197,7 +756,7 @@
+ 				buf_res.length = temp;
+ 
+ 			/* transfer data into FIFO */
+-			bus_space_write_region_4(sc->sc_io_tag, sc->sc_io_hdl,
++			dwc_otg_traced_write_region_4(sc->sc_io_tag, sc->sc_io_hdl,
+ 			    fifo, buf_res.buffer, buf_res.length / 4);
+ 
+ 			offset += buf_res.length;
+@@ -216,7 +775,7 @@
+ 		    sc->sc_bounce_buffer, count);
+ 
+ 		/* transfer data into FIFO */
+-		bus_space_write_region_4(sc->sc_io_tag,
++		dwc_otg_traced_write_region_4(sc->sc_io_tag,
+ 		    sc->sc_io_hdl, fifo, sc->sc_bounce_buffer,
+ 		    (count + 3) / 4);
+ 	}
+@@ -247,7 +806,7 @@
+ 				buf_res.length = temp;
+ 
+ 			/* transfer data from FIFO */
+-			bus_space_read_region_4(sc->sc_io_tag, sc->sc_io_hdl,
++			dwc_otg_traced_read_region_4(sc->sc_io_tag, sc->sc_io_hdl,
+ 			    sc->sc_current_rx_fifo, buf_res.buffer, buf_res.length / 4);
+ 
+ 			offset += buf_res.length;
+@@ -260,7 +819,7 @@
+ 	/* check for remainder */
+ 	if (count != 0) {
+ 		/* read data into bounce buffer */
+-		bus_space_read_region_4(sc->sc_io_tag, sc->sc_io_hdl,
++		dwc_otg_traced_read_region_4(sc->sc_io_tag, sc->sc_io_hdl,
+ 			sc->sc_current_rx_fifo,
+ 			sc->sc_bounce_buffer, (count + 3) / 4);
+ 
+@@ -353,7 +912,7 @@
+ 
+ 		for (x = 0; x != sc->sc_host_ch_max; x++) {
+ 			/* enable all host interrupts */
+-			DWC_OTG_WRITE_4(sc, DOTG_HCINTMSK(x),
++			dwc_otg_shadow_write_hcintmsk(sc, x,
+ 			    HCINT_DEFAULT_MASK);
+ 		}
+ 
+@@ -694,7 +1253,7 @@
+ 
+ 	if (sc->sc_current_rx_bytes != 0) {
+ 		/* need to dump remaining data */
+-		bus_space_read_region_4(sc->sc_io_tag, sc->sc_io_hdl,
++		dwc_otg_traced_read_region_4(sc->sc_io_tag, sc->sc_io_hdl,
+ 		    sc->sc_current_rx_fifo, sc->sc_bounce_buffer,
+ 		    sc->sc_current_rx_bytes / 4);
+ 		/* clear number of active bytes to receive */
+@@ -713,6 +1272,19 @@
+ 	hcint = DWC_OTG_READ_4(sc, DOTG_HCINT(x));
+ 	DWC_OTG_WRITE_4(sc, DOTG_HCINT(x), hcint);
+ 
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	if (x < 16) {
++		dwc_otg_diag_hcint_last[x] = hcint;
++		dwc_otg_diag_hcint_frame[x] = DWC_OTG_READ_4(sc, DOTG_HFNUM);
++		dwc_otg_diag_hcint_count[x]++;
++		if (hcint & HCINT_NAK)
++			dwc_otg_diag_hcint_nak[x]++;
++		if (hcint & HCINT_XACTERR)
++			dwc_otg_diag_hcint_xacterr[x]++;
++	}
++	dwc_otg_diag_hcint_clears++;
++#endif
++
+ 	/* clear buffered interrupts */
+ 	sc->sc_chan_state[x].hcint = 0;
+ }
+@@ -771,6 +1343,40 @@
+ 		if (dwc_otg_host_check_tx_fifo_empty(sc, td) != 0)
+ 			return (1);	/* busy - cannot transfer data */
+ 	}
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	/*
++	 * 2026-10-13: never have two channels on the same endpoint. The
++	 * hang capture of 2026-10-13 shows a NAK-driven ping-pong where
++	 * channel X is halted and channel Y is enabled for the same bulk
++	 * IN endpoint before X's halt has completed, ~700 times/s, until
++	 * the bus freezes. Linux dwc_otg never does this. Wait (bounded)
++	 * for the old IN channel to report "halted" first.
++	 */
++	if (dwc_otg_fix_enable != 0) {
++		for (x = 0; x != sc->sc_host_ch_max && x < 16; x++) {
++			uint32_t hc;
++			uint16_t age;
++
++			if (sc->sc_chan_state[x].allocated != 0 ||
++			    sc->sc_chan_state[x].wait_halted == 0)
++				continue;
++			hc = DWC_OTG_READ_4(sc, DOTG_HCCHAR(x));
++			if ((hc & HCCHAR_EPDIR_IN) == 0)
++				continue;
++			if (((hc ^ td->hcchar) &
++			    (HCCHAR_DEVADDR_MASK | HCCHAR_EPNUM_MASK)) != 0)
++				continue;
++			age = (sc->sc_last_frame_num - dwc_otg_halt_req_fn[x]) &
++			    DWC_OTG_FRAME_MASK;
++			if (age < DWC_OTG_HALT_WAIT_MAX) {
++				dwc_otg_diag_overlap_block++;
++				dwc_otg_enable_sof_irq(sc);
++				return (1);	/* busy - old channel still halting */
++			}
++			dwc_otg_diag_overlap_timeout++;
++		}
++	}
++#endif
+ 	z = td->max_packet_count;
+ 	for (x = y = 0; x != sc->sc_host_ch_max; x++) {
+ 		/* check if channel is allocated */
+@@ -792,6 +1398,9 @@
+ 		td->channel[2] = DWC_OTG_MAX_CHANNELS;
+ 		/* wait a bit */
+ 		dwc_otg_enable_sof_irq(sc);
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++		dwc_otg_diag_alloc_fail++;
++#endif
+ 		return (1);	/* busy - not enough channels */
+ 	}
+ 
+@@ -804,6 +1413,11 @@
+ 		/* set wait halted */
+ 		sc->sc_chan_state[x].wait_halted = 1;
+ 
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++		if (sc->sc_fiq != NULL)
++			sc->sc_fiq->channel[x].fsm = FIQ_PASSTHROUGH;
++#endif
++
+ 		/* clear interrupts */
+ 		dwc_otg_clear_hcint(sc, x);
+ 
+@@ -837,6 +1451,11 @@
+ 	 */
+ 	sc->sc_chan_state[x].allocated = 0;
+ 
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	if (sc->sc_fiq != NULL)
++		sc->sc_fiq->channel[x].fsm = FIQ_PASSTHROUGH;
++#endif
++
+ 	/* ack any pending messages */
+ 	if (sc->sc_last_rx_status != 0 &&
+ 	    GRXSTSRD_CHNUM_GET(sc->sc_last_rx_status) == x) {
+@@ -854,8 +1473,31 @@
+ 	hcchar = DWC_OTG_READ_4(sc, DOTG_HCCHAR(x));
+ 	if (hcchar & HCCHAR_CHENA) {
+ 		DPRINTF("Halting channel %d\n", x);
+-		DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(x),
+-		    hcchar | HCCHAR_CHDIS);
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++		/*
++		 * 2026-10-06: Linux dwc2 (slave mode) refuses to issue a
++		 * halt with CHENA|CHDIS when the TX request queue has no
++		 * free entry, because the halt itself needs a queue slot.
++		 * FreeBSD never checks. Count how often we hit that state.
++		 */
++		{
++			uint32_t eptype = (hcchar & HCCHAR_EPTYPE_MASK) >>
++			    HCCHAR_EPTYPE_SHIFT;
++			uint32_t qsts = (eptype == UE_ISOCHRONOUS ||
++			    eptype == UE_INTERRUPT) ?
++			    DWC_OTG_READ_4(sc, DOTG_HPTXSTS) :
++			    DWC_OTG_READ_4(sc, DOTG_GNPTXSTS);
++			if (((qsts >> 16) & 0xff) == 0) {
++				dwc_otg_diag_halt_qfull++;
++				dwc_otg_trace_putc('!');
++			}
++		}
++#endif
++		dwc_otg_shadow_write_hcchar(sc, x, hcchar | HCCHAR_CHDIS);
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++		if (x < 16)
++			dwc_otg_halt_req_fn[x] = sc->sc_last_frame_num;
++#endif
+ 		/* don't write HCCHAR until the channel is halted */
+ 	} else {
+ 		sc->sc_chan_state[x].wait_halted = 0;
+@@ -1023,22 +1665,22 @@
+ 	/* copy out control request */
+ 	usbd_copy_out(td->pc, 0, &req, sizeof(req));
+ 
+-	DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(td->channel[0]),
++	dwc_otg_shadow_write_hctsiz(sc, td->channel[0],
+ 	    (sizeof(req) << HCTSIZ_XFERSIZE_SHIFT) |
+ 	    (1 << HCTSIZ_PKTCNT_SHIFT) |
+ 	    (HCTSIZ_PID_SETUP << HCTSIZ_PID_SHIFT));
+ 
+-	DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(td->channel[0]), td->hcsplt);
++	dwc_otg_shadow_write_hcsplt(sc, td->channel[0], td->hcsplt);
+ 
+ 	hcchar = td->hcchar;
+ 	hcchar &= ~(HCCHAR_EPDIR_IN | HCCHAR_EPTYPE_MASK);
+ 	hcchar |= UE_CONTROL << HCCHAR_EPTYPE_SHIFT;
+ 
+ 	/* must enable channel before writing data to FIFO */
+-	DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(td->channel[0]), hcchar);
++	dwc_otg_shadow_write_hcchar(sc, td->channel[0], hcchar);
+ 
+ 	/* transfer data into FIFO */
+-	bus_space_write_region_4(sc->sc_io_tag, sc->sc_io_hdl,
++	dwc_otg_traced_write_region_4(sc->sc_io_tag, sc->sc_io_hdl,
+ 	    DOTG_DFIFO(td->channel[0]), (uint32_t *)&req, sizeof(req) / 4);
+ 
+ 	/* wait until next slot before trying complete split */
+@@ -1076,17 +1718,17 @@
+ 	td->hcsplt |= HCSPLT_COMPSPLT;
+ 	td->state = DWC_CHAN_ST_WAIT_C_ANE;
+ 
+-	DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(td->channel[0]),
++	dwc_otg_shadow_write_hctsiz(sc, td->channel[0],
+ 	    (HCTSIZ_PID_SETUP << HCTSIZ_PID_SHIFT));
+ 
+-	DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(td->channel[0]), td->hcsplt);
++	dwc_otg_shadow_write_hcsplt(sc, td->channel[0], td->hcsplt);
+ 
+ 	hcchar = td->hcchar;
+ 	hcchar &= ~(HCCHAR_EPDIR_IN | HCCHAR_EPTYPE_MASK);
+ 	hcchar |= UE_CONTROL << HCCHAR_EPTYPE_SHIFT;
+ 
+ 	/* must enable channel before writing data to FIFO */
+-	DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(td->channel[0]), hcchar);
++	dwc_otg_shadow_write_hcchar(sc, td->channel[0], hcchar);
+ 
+ busy:
+ 	return (1);	/* busy */
+@@ -1238,6 +1880,17 @@
+ 		return (0);
+ 	} else if (td->did_nak != 0) {
+ 		/* check if we should pause sending queries for 125us */
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++		/* 2026-10-13: Linux-style nak_holdoff (8 microframes at HS) */
++		if (dwc_otg_fix_enable != 0 &&
++		    sc->sc_flags.status_high_speed != 0 &&
++		    (uint8_t)(frame_num - td->tmr_res) <
++		    DWC_OTG_NAK_HOLDOFF_HS) {
++			dwc_otg_diag_nak_holdoff++;
++			dwc_otg_enable_sof_irq(sc);
++			goto busy;
++		}
++#endif
+ 		if (td->tmr_res == frame_num) {
+ 			/* wait a bit */
+ 			dwc_otg_enable_sof_irq(sc);
+@@ -1569,13 +2222,13 @@
+ 	  	channel = td->channel[x];
+ 
+ 		/* receive one packet */
+-		DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
++		dwc_otg_shadow_write_hctsiz(sc, channel,
+ 		    (td->max_packet_size << HCTSIZ_XFERSIZE_SHIFT) |
+ 		    (1 << HCTSIZ_PKTCNT_SHIFT) |
+ 		    (td->toggle ? (HCTSIZ_PID_DATA1 << HCTSIZ_PID_SHIFT) :
+ 		    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT)));
+ 
+-		DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(channel), td->hcsplt);
++		dwc_otg_shadow_write_hcsplt(sc, channel, td->hcsplt);
+ 
+ 		hcchar = td->hcchar;
+ 		hcchar |= HCCHAR_EPDIR_IN;
+@@ -1599,7 +2252,7 @@
+ 		}
+ 
+ 		/* must enable channel before data can be received */
+-		DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(channel), hcchar);
++		dwc_otg_shadow_write_hcchar(sc, channel, hcchar);
+ 	}
+ 	/* wait until next slot before trying complete split */
+ 	td->tt_complete_slot = sc->sc_last_frame_num + 1;
+@@ -1635,10 +2288,10 @@
+ 	td->state = DWC_CHAN_ST_WAIT_S_ANE;
+ 
+ 	/* receive one packet */
+-	DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
++	dwc_otg_shadow_write_hctsiz(sc, channel,
+ 	    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT));
+ 
+-	DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(channel), td->hcsplt);
++	dwc_otg_shadow_write_hcsplt(sc, channel, td->hcsplt);
+ 
+ 	/* send after next SOF event */
+ 	if ((sc->sc_last_frame_num & 1) == 0 &&
+@@ -1654,7 +2307,7 @@
+ 	td->tt_complete_slot = sc->sc_last_frame_num + 1;
+ 
+ 	/* must enable channel before data can be received */
+-	DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(channel), hcchar);
++	dwc_otg_shadow_write_hcchar(sc, channel, hcchar);
+ busy:
+ 	return (1);	/* busy */
+ 
+@@ -2004,20 +2657,20 @@
+ 			/* last packet */
+ 			switch (x) {
+ 			case 0:
+-				DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
++				dwc_otg_shadow_write_hctsiz(sc, channel,
+ 				    (count << HCTSIZ_XFERSIZE_SHIFT) |
+ 				    (1 << HCTSIZ_PKTCNT_SHIFT) |
+ 				    (td->toggle ? (HCTSIZ_PID_DATA1 << HCTSIZ_PID_SHIFT) :
+ 				    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT)));
+ 				break;
+ 			case 1:
+-				DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
++				dwc_otg_shadow_write_hctsiz(sc, channel,
+ 				    (count << HCTSIZ_XFERSIZE_SHIFT) |
+ 				    (1 << HCTSIZ_PKTCNT_SHIFT) |
+ 				    (HCTSIZ_PID_DATA1 << HCTSIZ_PID_SHIFT));
+ 				break;
+ 			default:
+-				DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
++				dwc_otg_shadow_write_hctsiz(sc, channel,
+ 				    (count << HCTSIZ_XFERSIZE_SHIFT) |
+ 				    (1 << HCTSIZ_PKTCNT_SHIFT) |
+ 				    (HCTSIZ_PID_DATA2 << HCTSIZ_PID_SHIFT));
+@@ -2026,21 +2679,21 @@
+ 		} else if (td->ep_type == UE_ISOCHRONOUS &&
+ 			   td->max_packet_count > 1) {
+ 			/* ISOCHRONOUS multi packet */
+-			DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
++			dwc_otg_shadow_write_hctsiz(sc, channel,
+ 			    (count << HCTSIZ_XFERSIZE_SHIFT) |
+ 			    (1 << HCTSIZ_PKTCNT_SHIFT) |
+ 			    (HCTSIZ_PID_MDATA << HCTSIZ_PID_SHIFT));
+ 		} else {
+ 			/* TODO: HCTSIZ_DOPNG */
+ 			/* standard BULK/INTERRUPT/CONTROL packet */
+-			DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
++			dwc_otg_shadow_write_hctsiz(sc, channel,
+ 			    (count << HCTSIZ_XFERSIZE_SHIFT) |
+ 			    (1 << HCTSIZ_PKTCNT_SHIFT) |
+ 			    (td->toggle ? (HCTSIZ_PID_DATA1 << HCTSIZ_PID_SHIFT) :
+ 			    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT)));
+ 		}
+ 
+-		DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(channel), td->hcsplt);
++		dwc_otg_shadow_write_hcsplt(sc, channel, td->hcsplt);
+ 
+ 		hcchar = td->hcchar;
+ 		hcchar &= ~HCCHAR_EPDIR_IN;
+@@ -2053,7 +2706,7 @@
+ 			hcchar &= ~HCCHAR_ODDFRM;
+ 
+ 		/* must enable before writing data to FIFO */
+-		DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(channel), hcchar);
++		dwc_otg_shadow_write_hcchar(sc, channel, hcchar);
+ 
+ 		if (count != 0) {
+ 			/* write data into FIFO */
+@@ -2101,10 +2754,10 @@
+  	td->hcsplt |= HCSPLT_COMPSPLT;
+ 	td->state = DWC_CHAN_ST_WAIT_C_ANE;
+ 
+-	DWC_OTG_WRITE_4(sc, DOTG_HCTSIZ(channel),
++	dwc_otg_shadow_write_hctsiz(sc, channel,
+ 	    (HCTSIZ_PID_DATA0 << HCTSIZ_PID_SHIFT));
+ 
+-	DWC_OTG_WRITE_4(sc, DOTG_HCSPLT(channel), td->hcsplt);
++	dwc_otg_shadow_write_hcsplt(sc, channel, td->hcsplt);
+ 
+ 	hcchar = td->hcchar;
+ 	hcchar &= ~HCCHAR_EPDIR_IN;
+@@ -2117,7 +2770,7 @@
+ 		hcchar &= ~HCCHAR_ODDFRM;
+ 
+ 	/* must enable channel before data can be received */
+-	DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(channel), hcchar);
++	dwc_otg_shadow_write_hcchar(sc, channel, hcchar);
+ 
+ 	/* wait until next slot before trying complete split */
+ 	td->tt_complete_slot = sc->sc_last_frame_num + 1;
+@@ -2443,6 +3096,147 @@
+ 	/* increment timer value */
+ 	sc->sc_tmr_val++;
+ 
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	/* Periodic diagnostic: print channel state every dwc_otg_diag_period s */
++	if (dwc_otg_diag_period > 0 &&
++	    (sc->sc_tmr_val % (100u * (unsigned)dwc_otg_diag_period)) == 0) {
++		uint8_t i;
++		uint8_t n_alloc = 0, n_wh = 0, n_stuck = 0;
++		for (i = 0; i < sc->sc_host_ch_max; i++) {
++			if (sc->sc_chan_state[i].allocated)
++				n_alloc++;
++			if (sc->sc_chan_state[i].wait_halted) {
++				n_wh++;
++				if (!sc->sc_chan_state[i].allocated)
++					n_stuck++;
++			}
++		}
++		printf("DWC_OTG t=%u: yld=%u afail=%u hok=%u rxd=%u "
++		    "ch=%u/%u alloc=%u wh=%u stuck=%u "
++		    "filt=%u/%u thr=%u/%u gi=0x%08x\n",
++		    (unsigned)sc->sc_tmr_val,
++		    (unsigned)dwc_otg_diag_yield,
++		    (unsigned)dwc_otg_diag_alloc_fail,
++		    (unsigned)dwc_otg_diag_halt_ok,
++		    (unsigned)dwc_otg_diag_rx_discard,
++		    (unsigned)sc->sc_host_ch_max,
++		    (unsigned)DWC_OTG_MAX_CHANNELS,
++		    n_alloc, n_wh, n_stuck,
++		    (unsigned)dwc_otg_diag_filt_enter,
++		    (unsigned)dwc_otg_diag_filt_exit,
++		    (unsigned)dwc_otg_diag_thr_enter,
++		    (unsigned)dwc_otg_diag_thr_exit,
++		    (unsigned)dwc_otg_diag_last_gintsts);
++		if (n_stuck > 0) {
++			for (i = 0; i < sc->sc_host_ch_max; i++)
++				printf("  ch%u: a=%u wh=%u hcint=0x%08x\n",
++				    i,
++				    (unsigned)sc->sc_chan_state[i].allocated,
++				    (unsigned)sc->sc_chan_state[i].wait_halted,
++				    (unsigned)sc->sc_chan_state[i].hcint);
++		}
++		/*
++		 * Hang-narrowing instrumentation (2026-05-21):
++		 * Snapshot host-controller registers + frame-number delta
++		 * to spot anything that drifts monotonically toward the hang.
++		 * HFNUM low 14 bits = current micro/full-frame counter.
++		 * HAINT/HAINTMSK = per-channel interrupt status / mask.
++		 * HPTXSTS / GNPTXSTS = periodic / non-periodic TX FIFO state.
++		 * HPRT = root port status.
++		 */
++		{
++			static uint32_t last_hfnum;
++			uint32_t hfnum    = DWC_OTG_READ_4(sc, DOTG_HFNUM);
++			uint32_t haint    = DWC_OTG_READ_4(sc, DOTG_HAINT);
++			uint32_t haintmsk = DWC_OTG_READ_4(sc, DOTG_HAINTMSK);
++			uint32_t gintsts  = DWC_OTG_READ_4(sc, DOTG_GINTSTS);
++			uint32_t gintmsk  = DWC_OTG_READ_4(sc, DOTG_GINTMSK);
++			uint32_t hptxsts  = DWC_OTG_READ_4(sc, DOTG_HPTXSTS);
++			uint32_t gnptxsts = DWC_OTG_READ_4(sc, DOTG_GNPTXSTS);
++			uint32_t hprt     = DWC_OTG_READ_4(sc, DOTG_HPRT);
++			uint32_t fn_now   = hfnum & 0x3FFF;
++			uint32_t fn_prev  = last_hfnum & 0x3FFF;
++			uint32_t fn_delta = (fn_now - fn_prev) & 0x3FFF;
++			last_hfnum = hfnum;
++			printf("  REG: HFNUM=0x%08x dFN=%u HAINT=0x%08x/0x%08x "
++			    "GINTSTS=0x%08x/0x%08x\n",
++			    (unsigned)hfnum, (unsigned)fn_delta,
++			    (unsigned)haint, (unsigned)haintmsk,
++			    (unsigned)gintsts, (unsigned)gintmsk);
++			printf("       HPTXSTS=0x%08x GNPTXSTS=0x%08x HPRT=0x%08x "
++			    "sc_last_fn=%u rxep=%u needsof=%u\n",
++			    (unsigned)hptxsts, (unsigned)gnptxsts, (unsigned)hprt,
++			    (unsigned)sc->sc_last_frame_num,
++			    (unsigned)sc->sc_active_rx_ep,
++			    (unsigned)sc->sc_needsof);
++		}
++		/*
++		 * Hang-signature dump (added 2026-05-23). On the last successful
++		 * 1Hz tick before the system locks up, this should reveal:
++		 *  - SOF rate (sof_count delta) — is SOF still firing?
++		 *  - Cumulative GINTSTS bits seen (gintsts_or) — any rare bit?
++		 *  - Per-channel last HCINT + at-which-frame — which channel
++		 *    fired most recently? What did it report? Are NAKs/XACTERRs
++		 *    accumulating on a specific channel?
++		 */
++		{
++			uint8_t i;
++			printf("  DIAG: sof=%u gintsts_or=0x%08x hcint_clears=%u halt_qfull=%u\n",
++			    (unsigned)dwc_otg_diag_sof_count,
++			    (unsigned)dwc_otg_diag_gintsts_or,
++			    (unsigned)dwc_otg_diag_hcint_clears,
++			    (unsigned)dwc_otg_diag_halt_qfull);
++			printf("  FIX(%s) WPROBE(%s): overlap_block=%u overlap_timeout=%u nak_holdoff=%u\n",
++			    dwc_otg_fix_enable ? "on" : "OFF",
++			    dwc_otg_wprobe_enable ? "on" : "OFF",
++			    (unsigned)dwc_otg_diag_overlap_block,
++			    (unsigned)dwc_otg_diag_overlap_timeout,
++			    (unsigned)dwc_otg_diag_nak_holdoff);
++			for (i = 0; i < sc->sc_host_ch_max && i < 16; i++) {
++				if (dwc_otg_diag_hcint_count[i] == 0)
++					continue;
++				printf("  ch%u: cnt=%u nak=%u xerr=%u "
++				    "last_hcint=0x%08x at_fn=%u\n",
++				    i,
++				    (unsigned)dwc_otg_diag_hcint_count[i],
++				    (unsigned)dwc_otg_diag_hcint_nak[i],
++				    (unsigned)dwc_otg_diag_hcint_xacterr[i],
++				    (unsigned)dwc_otg_diag_hcint_last[i],
++				    (unsigned)(dwc_otg_diag_hcint_frame[i] & 0x3FFF));
++			}
++		}
++		if (sc->sc_fiq != NULL) {
++			char fiq_log[128];
++			uint32_t n;
++
++			{
++			    uint32_t cpsr_val;
++			    __asm__ volatile ("mrs %0, cpsr" : "=r"(cpsr_val));
++			    {
++			        extern volatile uint32_t g_fiq_spsr_fix_count;
++			        printf("  FIQ: fiq=%u swirq=%u sof=%u pending=%u done=0x%x spsr_fix=%u\n",
++			            (unsigned)sc->sc_fiq->fiq_count,
++			            (unsigned)sc->sc_fiq->swirq_count,
++			            (unsigned)sc->sc_fiq->sof_count,
++			            (unsigned)sc->sc_fiq->irq_pending,
++			            (unsigned)sc->sc_fiq->channel_done_mask,
++			            (unsigned)g_fiq_spsr_fix_count);
++			    }
++			    printf("  GINTMSK=0x%08x CPSR=0x%08x(F=%u) FIQ_CTRL=0x%x QA7=0x%x\n",
++			        DWC_OTG_READ_4(sc, DOTG_GINTMSK),
++			        cpsr_val, (cpsr_val >> 6) & 1,
++			        (unsigned)(*(volatile uint32_t *)(uintptr_t)0x3F00B20C),
++			        (unsigned)(*(volatile uint32_t *)(uintptr_t)0x4000000C));
++			}
++			n = dwc_fiq_log_drain(fiq_log, sizeof(fiq_log) - 1);
++			if (n > 0) {
++				fiq_log[n] = '\0';
++				printf("  FIQ log: %s\n", fiq_log);
++			}
++		}
++	}
++#endif
++
+ 	/* enable SOF interrupt, which will poll jobs */
+ 	dwc_otg_enable_sof_irq(sc);
+ 
+@@ -2701,6 +3495,9 @@
+ 	if (++count == 16) {
+ 		/* give other interrupts a chance */
+ 		DPRINTF("Yield\n");
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++		dwc_otg_diag_yield++;
++#endif
+ 		return;
+ 	}
+ 
+@@ -2710,8 +3507,18 @@
+ 		x = ffs(haint) - 1;
+ 		if (x >= sc->sc_host_ch_max)
+ 			break;
+-		temp = DWC_OTG_READ_4(sc, DOTG_HCINT(x));
+-		DWC_OTG_WRITE_4(sc, DOTG_HCINT(x), temp);
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++		if (sc->sc_fiq != NULL &&
++		    sc->sc_fiq->channel[x].fsm != FIQ_PASSTHROUGH &&
++		    sc->sc_fiq->channel[x].fsm != FIQ_PASSTHROUGH_ERRORSTATE) {
++			temp = sc->sc_fiq->channel[x].hcint_copy;
++			sc->sc_fiq->channel[x].hcint_copy = 0;
++		} else
++#endif
++		{
++			temp = DWC_OTG_READ_4(sc, DOTG_HCINT(x));
++			DWC_OTG_WRITE_4(sc, DOTG_HCINT(x), temp);
++		}
+ 		temp &= ~HCINT_SOFTWARE_ONLY;
+ 		sc->sc_chan_state[x].hcint |= temp;
+ 		haint &= ~(1U << x);
+@@ -2739,6 +3546,9 @@
+ 				if (temp == GRXSTSRH_HALTED) {
+ 					ep_no = GRXSTSRD_CHNUM_GET(sc->sc_last_rx_status);
+ 					sc->sc_chan_state[ep_no].wait_halted = 0;
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++					dwc_otg_diag_halt_ok++;
++#endif
+ 					DPRINTFN(5, "channel halt complete ch=%u\n", ep_no);
+ 				}
+ 				/* store bytes and FIFO offset */
+@@ -2763,6 +3573,9 @@
+ 
+ 			/* check if we should dump the data */
+ 			if (!(sc->sc_active_rx_ep & (1U << ep_no))) {
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++				dwc_otg_diag_rx_discard++;
++#endif
+ 				dwc_otg_common_rx_ack(sc);
+ 				goto repeat;
+ 			}
+@@ -2858,10 +3671,21 @@
+ 	int retval = FILTER_HANDLED;
+ 	uint32_t status;
+ 
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	dwc_otg_diag_in_filter = 1;
++	dwc_otg_diag_filt_enter++;
++#endif
++
+ 	USB_BUS_SPIN_LOCK(&sc->sc_bus);
+ 
+ 	/* read and clear interrupt status */
+ 	status = DWC_OTG_READ_4(sc, DOTG_GINTSTS);
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	dwc_otg_diag_last_gintsts = status;
++	dwc_otg_diag_gintsts_or |= status;
++	if (status & GINTSTS_SOF)
++		dwc_otg_diag_sof_count++;
++#endif
+ 
+ 	/* clear interrupts we are handling here */
+ 	DWC_OTG_WRITE_4(sc, DOTG_GINTSTS, status & ~DWC_OTG_MSK_GINT_THREAD_IRQ);
+@@ -2901,6 +3725,10 @@
+ 
+ 	USB_BUS_SPIN_UNLOCK(&sc->sc_bus);
+ 
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	dwc_otg_diag_filt_exit++;
++	dwc_otg_diag_in_filter = 0;
++#endif
+ 	return (retval);
+ }
+ 
+@@ -2910,6 +3738,9 @@
+ 	struct dwc_otg_softc *sc = arg;
+ 	uint32_t status;
+ 
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	dwc_otg_diag_thr_enter++;
++#endif
+ 	USB_BUS_LOCK(&sc->sc_bus);
+ 	USB_BUS_SPIN_LOCK(&sc->sc_bus);
+ 
+@@ -3086,6 +3917,9 @@
+ 	}
+ 	USB_BUS_SPIN_UNLOCK(&sc->sc_bus);
+ 	USB_BUS_UNLOCK(&sc->sc_bus);
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	dwc_otg_diag_thr_exit++;
++#endif
+ }
+ 
+ static void
+@@ -3849,6 +4683,12 @@
+ 	sc->sc_io_hdl = rman_get_bushandle(sc->sc_io_res);
+ 	sc->sc_io_size = rman_get_size(sc->sc_io_res);
+ 
++#if defined(__rtems__) && defined(RPI_IOC_DEBUG)
++	sc->sc_fiq = dwc_fiq_get_state();
++	dwc_ring_sc = sc;
++	dwc_ring_init_and_dump();
++#endif
++
+ 	/* set up the bus structure */
+ 	sc->sc_bus.devices = sc->sc_devices;
+ 	sc->sc_bus.devices_max = DWC_OTG_MAX_DEVICES;
+@@ -4127,6 +4967,12 @@
+ 	 *   HCFG:    FSLSSUPP(bit2)=0 (allow HS)
+ 	 *   HPRT:    PrtSpd bits[18:17] becomes 0 (HIGH) after enumeration
+ 	 */
++#ifdef RPI_IOC_DEBUG
++	printk("DWC_OTG bus-trace ON: lower=before/UPPER=after access; "
++	    "c/d=HCCHAR(en/halt) r=HCCHAR-rd t=HCTSIZ s=HCSPLT m=HCINTMSK "
++	    "i/j=HCINT rd/wr p=GRXSTSP w/e=FIFO wr/rd h/q=HPRT wr/rd "
++	    "k=GINTMSK x/y=other wr/rd !=halt-with-queue-full\n");
++#endif /* RPI_IOC_DEBUG */
+ 	printk("DWC_OTG init done. PHY=%u(bits=%u) "
+ 	    "GUSBCFG=0x%08x GHWCFG2=0x%08x HCFG=0x%08x HPRT=0x%08x\n",
+ 	    (unsigned)sc->sc_phy_type, (unsigned)sc->sc_phy_bits,
+diff -ruN a/freebsd/sys/dev/usb/controller/dwc_otg_fiq_state.h b/freebsd/sys/dev/usb/controller/dwc_otg_fiq_state.h
+--- a/freebsd/sys/dev/usb/controller/dwc_otg_fiq_state.h	1969-12-31 16:00:00.000000000 -0800
++++ b/freebsd/sys/dev/usb/controller/dwc_otg_fiq_state.h	2026-10-14 10:13:16.412856258 -0700
+@@ -0,0 +1,266 @@
++/*
++ * DWC OTG FIQ FSM — shared state between FIQ handler and main driver.
++ *
++ * This header is included by both the FIQ-side code (Layer A/B) and the
++ * FreeBSD driver modifications (Layer C).  Nothing here may pull in RTEMS
++ * or FreeBSD headers — keep it freestanding.
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#ifndef DWC_OTG_FIQ_STATE_H
++#define DWC_OTG_FIQ_STATE_H
++
++#include <stdint.h>
++
++#define DWC_FIQ_MAX_CHANNELS 16
++#define DWC_FIQ_LOG_SIZE     4096  /* circular debug buffer bytes */
++
++/*
++ * BCM2835/2837 peripheral addresses (ARM physical).
++ * RPI_PERIPHERAL_BASE is 0x3F000000 on RPi 2/3.
++ */
++#define DWC_FIQ_RPI_PERIPH_BASE   0x3F000000u
++
++/* DWC OTG core registers */
++#define DWC_FIQ_USB_BASE          (DWC_FIQ_RPI_PERIPH_BASE + 0x980000u)
++
++/* MPHI (Multimedia Platform Host Interface) — software IRQ source.
++ * Used by Linux FIQ FSM for FIQ → IRQ signalling. */
++#define DWC_FIQ_MPHI_BASE         (DWC_FIQ_RPI_PERIPH_BASE + 0x6000u)
++#define DWC_FIQ_MPHI_OUTDDA       (DWC_FIQ_MPHI_BASE + 0x28u)
++#define DWC_FIQ_MPHI_OUTDDB       (DWC_FIQ_MPHI_BASE + 0x2Cu)
++#define DWC_FIQ_MPHI_CTRL         (DWC_FIQ_MPHI_BASE + 0x00u)
++#define DWC_FIQ_MPHI_INTSTAT      (DWC_FIQ_MPHI_BASE + 0x24u)
++#define DWC_FIQ_MPHI_SWIRQ_SET    (DWC_FIQ_MPHI_BASE + 0x1F0u)
++#define DWC_FIQ_MPHI_SWIRQ_CLR    (DWC_FIQ_MPHI_BASE + 0x1F4u)
++
++/* GPU system timer — SWIRQ source if MPHI is inaccessible.
++ * C3 is taken by the RTEMS clock driver; use C1 instead.
++ * (C0/C2 are reserved by the VideoCore GPU.) */
++#define DWC_FIQ_TIMER_BASE        (DWC_FIQ_RPI_PERIPH_BASE + 0x3000u)
++#define DWC_FIQ_TIMER_CS          (DWC_FIQ_TIMER_BASE + 0x00u)
++#define DWC_FIQ_TIMER_CLO         (DWC_FIQ_TIMER_BASE + 0x04u)
++#define DWC_FIQ_TIMER_C1          (DWC_FIQ_TIMER_BASE + 0x10u)
++#define DWC_FIQ_TIMER_CS_M1       0x00000002u
++
++/* BCM2835 interrupt controller */
++#define DWC_FIQ_INTC_BASE         (DWC_FIQ_RPI_PERIPH_BASE + 0xB200u)
++#define DWC_FIQ_INTC_FIQ_CTRL     (DWC_FIQ_INTC_BASE + 0x0Cu)
++
++/* BCM2835 IRQ numbers */
++#define DWC_FIQ_IRQ_USB           9u
++#define DWC_FIQ_IRQ_TIMER1        1u
++
++/* ------------------------------------------------------------------ */
++/* Direct MMIO — FIQ code cannot use bus_space_* or any RTEMS API.    */
++/* ------------------------------------------------------------------ */
++#define DWC_FIQ_REG(addr)  (*(volatile uint32_t *)(uintptr_t)(addr))
++
++/* DWC OTG register offsets from DWC_FIQ_USB_BASE */
++#define DWC_FIQ_GINTSTS    0x014u
++#define DWC_FIQ_GINTMSK    0x018u
++#define DWC_FIQ_HFNUM      0x408u
++#define DWC_FIQ_HAINT      0x414u
++#define DWC_FIQ_HAINTMSK   0x418u
++#define DWC_FIQ_HCCHAR(n)  (0x500u + 0x20u * (n))
++#define DWC_FIQ_HCSPLT(n)  (0x504u + 0x20u * (n))
++#define DWC_FIQ_HCINT(n)   (0x508u + 0x20u * (n))
++#define DWC_FIQ_HCINTMSK(n)(0x50Cu + 0x20u * (n))
++#define DWC_FIQ_HCTSIZ(n)  (0x510u + 0x20u * (n))
++#define DWC_FIQ_HCDMA(n)   (0x514u + 0x20u * (n))
++
++/* ------------------------------------------------------------------ */
++/* GINTSTS / GINTMSK bits used by FIQ dispatch.                        */
++/* ------------------------------------------------------------------ */
++#define DWC_FIQ_GINTSTS_SOF       (1u << 3)
++#define DWC_FIQ_GINTSTS_HCHINT    (1u << 25)
++
++/* ------------------------------------------------------------------ */
++/* HCINT bits — channel interrupt status.                              */
++/* ------------------------------------------------------------------ */
++#define DWC_FIQ_HCINT_XFERCOMPL   (1u << 0)
++#define DWC_FIQ_HCINT_CHHLTD      (1u << 1)
++#define DWC_FIQ_HCINT_AHBERR      (1u << 2)
++#define DWC_FIQ_HCINT_STALL       (1u << 3)
++#define DWC_FIQ_HCINT_NAK         (1u << 4)
++#define DWC_FIQ_HCINT_ACK         (1u << 5)
++#define DWC_FIQ_HCINT_NYET        (1u << 6)
++#define DWC_FIQ_HCINT_XACTERR     (1u << 7)
++#define DWC_FIQ_HCINT_BBLERR      (1u << 8)
++#define DWC_FIQ_HCINT_FRMOVRUN    (1u << 9)
++#define DWC_FIQ_HCINT_DATATGLERR  (1u << 10)
++
++/* ------------------------------------------------------------------ */
++/* HCCHAR bits.                                                        */
++/* ------------------------------------------------------------------ */
++#define DWC_FIQ_HCCHAR_CHENA      (1u << 31)
++#define DWC_FIQ_HCCHAR_CHDIS      (1u << 30)
++#define DWC_FIQ_HCCHAR_ODDFRM     (1u << 29)
++#define DWC_FIQ_HCCHAR_EPDIR_IN   (1u << 15)
++
++/* ------------------------------------------------------------------ */
++/* HCSPLT bits.                                                        */
++/* ------------------------------------------------------------------ */
++#define DWC_FIQ_HCSPLT_SPLTENA    (1u << 31)
++#define DWC_FIQ_HCSPLT_COMPSPLT   (1u << 16)
++
++/* ------------------------------------------------------------------ */
++/* HFNUM — frame number register.                                      */
++/* ------------------------------------------------------------------ */
++#define DWC_FIQ_HFNUM_FRNUM_MASK  0x0000FFFFu
++
++/* Max CSPLIT retries before aborting (Linux uses 3). */
++#define DWC_FIQ_CSPLIT_RETRIES    3
++/* Max transaction errors before aborting. */
++#define DWC_FIQ_MAX_ERRORS        3
++
++/* ------------------------------------------------------------------ */
++/* Per-channel FSM states.                                             */
++/* Modelled on Linux dwc_otg_fiq_fsm.h — states added incrementally.  */
++/* Phase 1: only PASSTHROUGH and PASSTHROUGH_ERRORSTATE.               */
++/* ------------------------------------------------------------------ */
++enum dwc_fiq_fsm_state {
++    /* Channel not managed by FIQ — all events forwarded to IRQ. */
++    FIQ_PASSTHROUGH             = 0,
++    FIQ_PASSTHROUGH_ERRORSTATE  = 1,
++
++    /* --- Phase 3: periodic split states (to be added) --- */
++    FIQ_PER_SSPLIT_QUEUED       = 10,
++    FIQ_PER_SSPLIT_STARTED      = 11,
++    FIQ_PER_SSPLIT_LAST         = 12,
++    FIQ_PER_CSPLIT_WAIT         = 13,
++    FIQ_PER_CSPLIT_NYET1        = 14,
++    FIQ_PER_CSPLIT_BROKEN_NYET1 = 15,
++    FIQ_PER_CSPLIT_NYET_FAFF    = 16,
++    FIQ_PER_CSPLIT_POLL         = 17,
++    FIQ_PER_CSPLIT_LAST         = 18,
++    FIQ_PER_SPLIT_DONE          = 19,
++    FIQ_PER_SPLIT_LS_ABORTED    = 20,
++    FIQ_PER_SPLIT_HS_ABORTED    = 21,
++    FIQ_PER_SPLIT_NYET_ABORTED  = 22,
++    FIQ_PER_SPLIT_TIMEOUT       = 23,
++
++    /* --- Phase 4: non-periodic split states (to be added) --- */
++    FIQ_NP_SSPLIT_STARTED       = 30,
++    FIQ_NP_SSPLIT_RETRY         = 31,
++    FIQ_NP_SSPLIT_PENDING       = 32,
++    FIQ_NP_OUT_CSPLIT_RETRY     = 33,
++    FIQ_NP_IN_CSPLIT_RETRY      = 34,
++    FIQ_NP_SPLIT_DONE           = 35,
++    FIQ_NP_SPLIT_LS_ABORTED     = 36,
++    FIQ_NP_SPLIT_HS_ABORTED     = 37,
++
++    /* --- Phase 4: isochronous (optional) --- */
++    FIQ_PER_ISO_OUT_PENDING     = 50,
++    FIQ_PER_ISO_OUT_ACTIVE      = 51,
++    FIQ_PER_ISO_OUT_LAST        = 52,
++    FIQ_PER_ISO_OUT_DONE        = 53,
++    FIQ_HS_ISOC_TURBO           = 60,
++    FIQ_HS_ISOC_SLEEPING        = 61,
++    FIQ_HS_ISOC_DONE            = 62,
++    FIQ_HS_ISOC_ABORTED         = 63,
++
++    /* Admin */
++    FIQ_DEQUEUE_ISSUED          = 70,
++};
++
++/* ------------------------------------------------------------------ */
++/* Per-channel shadow state.                                           */
++/*                                                                     */
++/* HANDOFF PROTOCOL (review finding #6):                               */
++/*   Task context (Layer C) writes all shadow fields, then does a DMB, */
++/*   then sets .fsm to non-PASSTHROUGH.  FIQ checks .fsm first; if    */
++/*   PASSTHROUGH, it ignores shadow fields entirely.  FIQ never writes */
++/*   .fsm back to PASSTHROUGH — that's Layer C's job after SWIRQ.     */
++/* ------------------------------------------------------------------ */
++struct dwc_fiq_channel_state {
++    enum dwc_fiq_fsm_state fsm;
++
++    /* Shadow copies of host-channel registers (written by Layer C). */
++    uint32_t hcchar_copy;
++    uint32_t hcsplt_copy;
++    uint32_t hcint_copy;
++    uint32_t hcintmsk_copy;
++    uint32_t hctsiz_copy;
++    uint32_t hcdma_copy;
++
++    /* Per-channel bookkeeping */
++    uint32_t nr_errors;
++    uint32_t hub_addr;
++    uint32_t port_addr;
++    uint32_t expected_uframe;
++    uint32_t nrpackets;
++    uint32_t nyet_count;
++    uint32_t csplit_count;
++};
++
++/* ------------------------------------------------------------------ */
++/* Global FIQ state — one instance, allocated by Layer A init.         */
++/* ------------------------------------------------------------------ */
++struct dwc_fiq_state {
++    /* DWC OTG core base (ARM physical, for direct MMIO from FIQ). */
++    uint32_t usb_base;
++
++    /* Number of host channels present in hardware. */
++    uint32_t num_channels;
++
++    /* Shadow interrupt masks (Layer C writes, FIQ reads). */
++    uint32_t gintmsk_saved;
++    uint32_t haintmsk_saved;
++
++    /* FIQ → IRQ signalling: nonzero = use MPHI, zero = use timer C3. */
++    uint32_t use_mphi;
++
++    /* Set by FIQ when SWIRQ is pending; cleared by IRQ handler. */
++    volatile uint32_t irq_pending;
++
++    /* Bitmask of channels in a terminal FSM state needing SWIRQ pickup. */
++    volatile uint32_t channel_done_mask;
++
++    /* Bitmask of channels with active (non-PASSTHROUGH) FSM states.
++     * Set by Layer C on handoff, cleared by FIQ on terminal state.
++     * FIQ only handles SOF when this is nonzero. */
++    volatile uint32_t fsm_active_mask;
++
++    /* FIQ-side counters. */
++    volatile uint32_t fiq_count;
++    volatile uint32_t swirq_count;
++    volatile uint32_t sof_count;
++
++    /* Circular debug log (review finding: must be in Phase 1). */
++    volatile uint32_t log_head;
++    char log_buf[DWC_FIQ_LOG_SIZE];
++
++    /* Per-channel state. */
++    struct dwc_fiq_channel_state channel[DWC_FIQ_MAX_CHANNELS];
++};
++
++/* ------------------------------------------------------------------ */
++/* FIQ debug log — writes to circular buffer, safe from FIQ context.   */
++/* ------------------------------------------------------------------ */
++static inline void dwc_fiq_log_char(struct dwc_fiq_state *st, char c)
++{
++    uint32_t h = st->log_head;
++    st->log_buf[h] = c;
++    st->log_head = (h + 1) & (DWC_FIQ_LOG_SIZE - 1);
++}
++
++static inline void dwc_fiq_log_hex32(struct dwc_fiq_state *st, uint32_t v)
++{
++    static const char hex[] = "0123456789abcdef";
++    int i;
++    for (i = 28; i >= 0; i -= 4)
++        dwc_fiq_log_char(st, hex[(v >> i) & 0xF]);
++    dwc_fiq_log_char(st, ' ');
++}
++
++/* ------------------------------------------------------------------ */
++/* ARM memory barrier — used in handoff protocol.                      */
++/* ------------------------------------------------------------------ */
++static inline void dwc_fiq_dmb(void)
++{
++    __asm__ volatile ("dmb" ::: "memory");
++}
++
++#endif /* DWC_OTG_FIQ_STATE_H */
+diff -ruN a/freebsd/sys/dev/usb/controller/dwc_otg.h b/freebsd/sys/dev/usb/controller/dwc_otg.h
+--- a/freebsd/sys/dev/usb/controller/dwc_otg.h	2026-10-14 10:13:16.409856245 -0700
++++ b/freebsd/sys/dev/usb/controller/dwc_otg.h	2026-10-14 10:13:16.412856258 -0700
+@@ -214,6 +214,10 @@
+ 	uint8_t	sc_hub_idata[1];
+ 
+ 	struct dwc_otg_flags sc_flags;
++
++#ifdef __rtems__
++	struct dwc_fiq_state *sc_fiq;
++#endif
+ };
+ 
+ /* prototypes */
+@@ -223,6 +227,7 @@
+ int dwc_otg_init(struct dwc_otg_softc *);
+ void dwc_otg_uninit(struct dwc_otg_softc *);
+ #ifdef __rtems__
++struct dwc_fiq_state;
+ void dwc_otg_platform_init(struct dwc_otg_softc *);
+ #endif /* __rtems__ */
+ 
+diff -ruN a/rtemsbsd/sys/dev/usb/controller/dwc_otg_nexus.c b/rtemsbsd/sys/dev/usb/controller/dwc_otg_nexus.c
+--- a/rtemsbsd/sys/dev/usb/controller/dwc_otg_nexus.c	2026-10-14 10:13:16.411856254 -0700
++++ b/rtemsbsd/sys/dev/usb/controller/dwc_otg_nexus.c	2026-10-14 10:13:16.413856262 -0700
+@@ -58,6 +58,17 @@
+ static int
+ dwc_otg_probe(device_t dev)
+ {
++#ifdef MIREK_DISABLE_DWC_OTG
++	/* 2026-05-23 hang isolation test: refuse to attach so libbsd never
++	 * starts the DWC OTG host controller. Question: does the ~187 s
++	 * BCM2837 AHB lockup still happen with DWC OTG entirely off?
++	 * Revert by removing MIREK_DISABLE_DWC_OTG from the libbsd build. */
++	device_printf(dev, "MIREK_DISABLE_DWC_OTG: refusing attach\n");
++	return (ENXIO);
++#else
++	device_set_desc(dev, "DWC OTG 2.0 integrated USB controller");
++	return (BUS_PROBE_DEFAULT);
++#endif
+ }
+ 
+ static int

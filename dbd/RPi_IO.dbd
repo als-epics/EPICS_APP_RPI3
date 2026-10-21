@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2003 Argonne National Laboratory
+#
+# SPDX-License-Identifier: EPICS
+
+# RPi_IOSup: Raspberry Pi GPIO
+#   INP/OUT links are INST_IO and name the pin LABEL given to
+#   rpiGpioConfigOutput / rpiGpioConfigInput in the startup script.
+device(bo,         INST_IO, devBoRPiGpio,  "RPiGpio")
+device(bi,         INST_IO, devBiRPiGpio,  "RPiGpio")
+device(mbboDirect, INST_IO, devMbboDirectRPiGpio, "RPiGpio")
+device(mbbiDirect, INST_IO, devMbbiDirectRPiGpio, "RPiGpio")
+device(longin,     INST_IO, devLiRPiGpio,  "RPiGpio")
+# dbior report (same table as rpiGpioReport)
+driver(drvRPiGpio)
+registrar(rpiGpioRegistrar)

@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2022 Argonne National Laboratory
+#
+# SPDX-License-Identifier: EPICS
+
+# Before adding patterns here, please read the gitignore
+# documentation at https://git-scm.com/docs/gitignore
+
+# Install directories. Committed for the Raspberry Pi (ready to copy to the
+# SD card or the TFTP root): the kernel images, the loadable module objects
+# and epics.tar.gz in bin/RTEMS-raspberrypi2/, the installed dbd files and
+# the installed db/substitutions files. The ELF files, the pre-link image
+# used only to generate the libdl symbol table, and the rest are not.
+/bin/*
+!/bin/RTEMS-raspberrypi2/
+/bin/RTEMS-raspberrypi2/*
+!/bin/RTEMS-raspberrypi2/*.img
+!/bin/RTEMS-raspberrypi2/*.o
+!/bin/RTEMS-raspberrypi2/*.gz
+/bin/RTEMS-raspberrypi2/rpi3_prelink*
+/cfg/
+/db/*
+!/db/*.db
+!/db/*.substitutions
+/dbd/*
+!/dbd/*.dbd
+/html/
+/include/
+/lib/*
+!/lib/RTEMS-raspberrypi2/
+/lib/RTEMS-raspberrypi2/*
+!/lib/RTEMS-raspberrypi2/*.a
+/templates/
+
+# Local configuration files
+/configure/*.local
+
+# iocBoot generated files
+/iocBoot/*ioc*/cdCommands
+/iocBoot/*ioc*/dllPath.bat
+/iocBoot/*ioc*/envPaths
+/iocBoot/*ioc*/relPaths.sh
+
+# iocsh
+.iocsh_history
+
+# Build directories
+O.*/
+
+# Common files created by other tools
+.DS_Store
+
+# Session leftovers (serial captures, stray objects)
+*.cap
+*.o
+!/bin/RTEMS-raspberrypi2/*.o
+
+# Editor swap/backup files
+*.swp
+*~

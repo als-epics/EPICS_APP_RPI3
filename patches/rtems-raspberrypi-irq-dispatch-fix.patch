@@ -1,0 +1,21 @@
+--- a/bsps/arm/raspberrypi/irq/irq.c
++++ b/bsps/arm/raspberrypi/irq/irq.c
+@@ -115,7 +115,17 @@
+ 
+   pend = BCM2835_REG(BCM2835_IRQ_BASIC);
+   if ( pend & BCM2835_IRQ_BASIC_SPEEDUP_USED_BITS ) {
+-    pend_bit = ffs(pend) - 1;
++    /*
++     * Only the speed-up bits may be fed to ffs().  Bit 8 ("one or more
++     * bits set in pending register 1") is set as well when a non-speed-up
++     * GPU interrupt (e.g. the system timer tick, GPU IRQ 3) is pending at
++     * the same time as a speed-up one (e.g. USB, GPU IRQ 9).  ffs(pend)
++     * then selects bit 8 whose table entry is -1, no handler is called,
++     * the interrupt stays asserted and the CPU re-enters this function
++     * forever (observed as a system hang on Raspberry Pi 3B+ under USB
++     * load).
++     */
++    pend_bit = ffs(pend & BCM2835_IRQ_BASIC_SPEEDUP_USED_BITS) - 1;
+     vector = bcm2835_irq_speedup_table[pend_bit];
+   } else {
+     pend = BCM2835_REG(BCM2835_IRQ_PENDING1);

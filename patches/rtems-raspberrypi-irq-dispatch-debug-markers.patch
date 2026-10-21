@@ -1,0 +1,106 @@
+--- a/bsps/arm/raspberrypi/irq/irq.c
++++ b/bsps/arm/raspberrypi/irq/irq.c
+@@ -89,12 +89,50 @@
+ #define BCM2835_IRQ_BASIC_SPEEDUP_USED_BITS 0x1ffcff
+ 
+ /*
++ * MIREK-PATCH 2026-10-13: crash-ring markers around every peripheral access
++ * of the IRQ dispatch path (hang diagnosis, RPi 3B+ DWC OTG).  The strong
++ * definitions live in rtems-libbsd dwc_otg.c; the references are weak so a
++ * plain RTEMS application (no libbsd) still links and skips them.
++ *   MK 0x4958 ('IX') IRQ_BASIC read      (end val = pending bits)
++ *   MK 0x4950 ('IP') IRQ_PENDING1/2 read (begin val = 1/2, end val = bits)
++ *   MK 0x4948 ('IH') handler dispatch    (val = vector)
++ */
++/* #define RPI_IOC_DEBUG 1 */   /* same switch name as in libbsd dwc_otg.c */
++#ifdef RPI_IOC_DEBUG
++void *dwc_otg_ring_mark_begin(uint32_t tag16, uint32_t val) __attribute__((weak));
++void dwc_otg_ring_mark_end_val(void *handle, uint32_t val) __attribute__((weak));
++
++static inline void *mirek_mb(uint32_t tag, uint32_t val)
++{
++  return dwc_otg_ring_mark_begin != NULL ? dwc_otg_ring_mark_begin(tag, val) : NULL;
++}
++
++static inline void mirek_me(void *h, uint32_t val)
++{
++  if (dwc_otg_ring_mark_end_val != NULL)
++    dwc_otg_ring_mark_end_val(h, val);
++}
++#else
++static inline void *mirek_mb(uint32_t tag, uint32_t val)
++{
++  (void) tag; (void) val;
++  return NULL;
++}
++
++static inline void mirek_me(void *h, uint32_t val)
++{
++  (void) h; (void) val;
++}
++#endif /* RPI_IOC_DEBUG */
++
++/*
+  * Determine the source of the interrupt and dispatch the correct handler.
+  */
+ void bsp_interrupt_dispatch(void)
+ {
+   unsigned int pend;
+   unsigned int pend_bit;
++  void *mh;
+ 
+   rtems_vector_number vector = 255;
+ 
+@@ -113,27 +151,32 @@
+     return;
+ #endif /* RTEMS_SMP */
+ 
++  mh = mirek_mb(0x4958, 0);
+   pend = BCM2835_REG(BCM2835_IRQ_BASIC);
++  mirek_me(mh, pend);
++  /*
++   * MIREK-FIX 2026-10-13: ffs() must only look at the speed-up bits.
++   * IRQ_BASIC bit 8 ("one or more bits set in pending register 1") can be
++   * set together with a speed-up bit (seen: 0x900 = GPU IRQ 9 (USB) + bit 8
++   * because the system-timer tick, GPU IRQ 3, was pending as well).  The
++   * original ffs(pend) then picked bit 8, whose table entry is -1, no
++   * handler was called, the IRQ stayed asserted and the CPU re-entered this
++   * dispatcher forever: the "RPi 3B+ USB hang" after ~30 s..3 min.
++   */
+   if ( pend & BCM2835_IRQ_BASIC_SPEEDUP_USED_BITS ) {
+-    /*
+-     * Only the speed-up bits may be fed to ffs().  Bit 8 ("one or more
+-     * bits set in pending register 1") is set as well when a non-speed-up
+-     * GPU interrupt (e.g. the system timer tick, GPU IRQ 3) is pending at
+-     * the same time as a speed-up one (e.g. USB, GPU IRQ 9).  ffs(pend)
+-     * then selects bit 8 whose table entry is -1, no handler is called,
+-     * the interrupt stays asserted and the CPU re-enters this function
+-     * forever (observed as a system hang on Raspberry Pi 3B+ under USB
+-     * load).
+-     */
+     pend_bit = ffs(pend & BCM2835_IRQ_BASIC_SPEEDUP_USED_BITS) - 1;
+     vector = bcm2835_irq_speedup_table[pend_bit];
+   } else {
++    mh = mirek_mb(0x4950, 1);
+     pend = BCM2835_REG(BCM2835_IRQ_PENDING1);
++    mirek_me(mh, pend);
+     if ( pend != 0 ) {
+       pend_bit = ffs(pend) - 1;
+       vector = pend_bit;
+     } else {
++      mh = mirek_mb(0x4950, 2);
+       pend = BCM2835_REG(BCM2835_IRQ_PENDING2);
++      mirek_me(mh, pend);
+       if ( pend != 0 ) {
+         pend_bit = ffs(pend) - 1;
+         vector = pend_bit + 32;
+@@ -143,7 +186,9 @@
+ 
+   if ( vector < 255 )
+   {
++      mh = mirek_mb(0x4948, vector);
+       bsp_interrupt_handler_dispatch(vector);
++      mirek_me(mh, vector);
+   }
+ }
+ 

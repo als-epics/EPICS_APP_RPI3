@@ -1,0 +1,30 @@
+# Extended menuScan.dbd — replaces base's copy via the dbd -I search order.
+#
+# dbdExpand.pl's search path (from rpi3App/src/Makefile) resolves
+# `include "menuScan.dbd"` in base.dbd to THIS file first, so these choices
+# become the registered menu. Keep all existing choices identical to base
+# so records that reference the standard rates still work, then append
+# the new faster rate(s).
+#
+# NOTE: .01 second scan requires CONFIGURE_MICROSECONDS_PER_TICK < 10000 us.
+# We set it to 500 (us) in configure/CONFIG_SITE.local, giving a 2 kHz tick
+# and <= 0.5 ms scheduling jitter on a 10 ms scan.
+# .001 second (added 2026-10-14) is 2 ticks at that rate: the scan thread
+# wakes every 1 ms with up to 0.5 ms jitter. Use it for a few light records
+# only; dbScan parses the period from the choice text, no C code changes.
+
+menu(menuScan) {
+    choice(menuScanPassive,     "Passive")
+    choice(menuScanEvent,       "Event")
+    choice(menuScanI_O_Intr,    "I/O Intr")
+    # Periodic scans, slowest to fastest
+    choice(menuScan10_second,   "10 second")
+    choice(menuScan5_second,    "5 second")
+    choice(menuScan2_second,    "2 second")
+    choice(menuScan1_second,    "1 second")
+    choice(menuScan_5_second,   ".5 second")
+    choice(menuScan_2_second,   ".2 second")
+    choice(menuScan_1_second,   ".1 second")
+    choice(menuScan_01_second,  ".01 second")
+    choice(menuScan_001_second, ".001 second")
+}

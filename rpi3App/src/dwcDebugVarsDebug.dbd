@@ -1,0 +1,6 @@
+variable(dwc_otg_fix_enable,int)
+variable(dwc_otg_trace_enable,int)
+variable(dwc_otg_wprobe_enable,int)
+variable(dwc_otg_icmask_enable,int)
+variable(dwc_otg_icmask_probe,int)
+variable(dwc_otg_diag_period,int)

@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: EPICS
+#
+# Timing test: toggle an output from a periodic calc record and count the
+# resulting edges on an input, without any network traffic involved.
+#
+#   rpiGpioConfigOutput("TOGGLE", 17, 0)
+#   rpiGpioConfigInput("SENSE", 27, "none", "both")
+#   dbLoadRecords("db/rpiGpioToggleTest.db", "P=RPI3,OUT=TOGGLE,IN=SENSE,RATE=.001 second")
+#
+# Wire GPIO17 to GPIO27 (and to the oscilloscope). With RATE ".001 second"
+# the output toggles every 1 ms = 500 Hz square wave; $(P):TGL:CNT must
+# then grow by 1000 per second.  Set $(P):TGL:RUN to 0 to stop toggling.
+# Jitter seen on the scope = scan-thread wake-up jitter (RTEMS tick 500 us)
+# plus record processing time.
+
+record(bo, "$(P):TGL:RUN") {
+    field(DESC, "toggle enable")
+    field(ZNAM, "Stopped")
+    field(ONAM, "Running")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+record(calc, "$(P):TGL") {
+    field(DESC, "toggles at $(RATE)")
+    field(SCAN, "$(RATE)")
+    field(INPA, "$(P):TGL.VAL")
+    field(INPB, "$(P):TGL:RUN")
+    field(CALC, "B ? !A : A")
+    field(FLNK, "$(P):TGL:OUT")
+}
+
+record(bo, "$(P):TGL:OUT") {
+    field(DESC, "GPIO output $(OUT)")
+    field(DTYP, "RPiGpio")
+    field(OUT,  "@$(OUT)")
+    field(OMSL, "closed_loop")
+    field(DOL,  "$(P):TGL")
+    field(ZNAM, "Low")
+    field(ONAM, "High")
+}
+
+record(longin, "$(P):TGL:CNT") {
+    field(DESC, "edges seen on $(IN)")
+    field(DTYP, "RPiGpio")
+    field(INP,  "@$(IN) count")
+    field(SCAN, "1 second")
+}
+
+record(calc, "$(P):TGL:RATE") {
+    field(DESC, "edges per second on $(IN)")
+    field(SCAN, "1 second")
+    field(INPA, "$(P):TGL:CNT PP")
+    field(INPB, "$(P):TGL:RATE.LA")
+    field(CALC, "A-B")
+    field(EGU,  "Hz")
+}
+
+record(bi, "$(P):SENSE") {
+    field(DESC, "live level of $(IN)")
+    field(DTYP, "RPiGpio")
+    field(INP,  "@$(IN)")
+    field(SCAN, "1 second")
+    field(ZNAM, "Low")
+    field(ONAM, "High")
+}

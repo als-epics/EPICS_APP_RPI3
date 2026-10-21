@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2015 Argonne National Laboratory
+#
+# SPDX-License-Identifier: EPICS
+
+record(lsi, "$(user):VERSION") {
+    field(DTYP, "rpi3 version")
+    field(DESC, "Version string")
+    field(SIZV, "$(SIZV=200)")
+    field(PINI, "YES")
+}

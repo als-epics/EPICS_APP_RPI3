@@ -1,0 +1,26 @@
+--- a/modules/libcom/src/osi/os/RTEMS-posix/osdTime.cpp
++++ b/modules/libcom/src/osi/os/RTEMS-posix/osdTime.cpp
+@@ -995,9 +995,21 @@
+             int n = read(sockfd, &packet, sizeof(packet));
+             close(sockfd);
+             if (n >= (int)sizeof(packet)) {
++                /* 2026-10-14: use the 32-bit NTP fraction as well. With
++                 * tv_nsec forced to 0 the EPICS NTPTime provider measured
++                 * its tick rate from whole seconds (up to 1.7 % error) and
++                 * corrected the IOC clock with a jump at every 60 s sync,
++                 * visible as a 70 ms disturbance of all periodic scans
++                 * once a minute. Set CLOCK_REALTIME only once; EPICS keeps
++                 * its own synchronised time afterwards. */
++                static int os_clock_set;
+                 ts->tv_sec  = (time_t)(ntohl(packet.txTm_s) - NTP_TIMESTAMP_DELTA);
+-                ts->tv_nsec = 0;
+-                clock_settime(CLOCK_REALTIME, ts);
++                ts->tv_nsec = (long)(((uint64_t)ntohl(packet.txTm_f) *
++                                      1000000000ULL) >> 32);
++                if (!os_clock_set) {
++                    clock_settime(CLOCK_REALTIME, ts);
++                    os_clock_set = 1;
++                }
+                 return 0;
+             }
+         }

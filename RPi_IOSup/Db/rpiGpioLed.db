@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: EPICS
+#
+# Raspberry Pi GPIO: one LED output and one interrupt-driven input.
+#
+# Startup script (before iocInit):
+#   rpiGpioConfigOutput("LED", 17, 0)              # GPIO17 = header pin 11
+#   rpiGpioConfigInput("BTN", 27, "up", "falling") # GPIO27 = header pin 13
+#   dbLoadRecords("db/rpiGpioLed.db", "P=RPI3,OUT=LED,IN=BTN")
+#
+# Wiring: GPIO17 -> 330 ohm -> LED anode, LED cathode -> GND (pin 9).
+#         Button between GPIO27 and GND (internal pull-up selected).
+
+record(bo, "$(P):LED") {
+    field(DESC, "GPIO output $(OUT)")
+    field(DTYP, "RPiGpio")
+    field(OUT,  "@$(OUT)")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bi, "$(P):BTN") {
+    field(DESC, "GPIO input $(IN), on interrupt")
+    field(DTYP, "RPiGpio")
+    field(INP,  "@$(IN) latched")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+    field(ONAM, "High")
+}
+
+record(longin, "$(P):BTN:CNT") {
+    field(DESC, "edges detected on $(IN)")
+    field(DTYP, "RPiGpio")
+    field(INP,  "@$(IN) count")
+    field(SCAN, "I/O Intr")
+}

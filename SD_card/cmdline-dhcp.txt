@@ -1,0 +1,1 @@
+--console=/dev/ttyS0 --net=dhcp,ntp=172.233.177.198 console=serial0,115200 console=tty1
