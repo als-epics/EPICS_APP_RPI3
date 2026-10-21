@@ -8,7 +8,7 @@ run and again 2026-10-15 after a second overnight run at 1 kHz scan rate
 (17 h 47 min, no reboot, 1000 edges/s constant); the six-month "USB hang" turned out to be a one-line bug in the RTEMS
 BSP interrupt dispatcher (fixed, patch included).
 
-Author: Miroslaw Dach (miroslaw.dach@gmail.com). Claude Code assisted in
+Author: Miroslaw Dach (mdach@lbl.com). Claude Code assisted in
 creating this project.
 
 ## Where to start
