@@ -27,6 +27,8 @@ epicsEnvSet EPICS_TS_NTP_INET   172.233.177.198
 NTPTimeSyncNow
 # Pacific time zone: PST=UTC-8, DST starts 2nd Sun Mar, ends 1st Sun Nov
 epicsEnvSet TZ                   "PST8PDT,M3.2.0,M11.1.0"
+# EPICS_TZ for iocStats (RPI3:TIMEZONE) and Base time routines: same rule as TZ
+epicsEnvSet EPICS_TZ             "$(TZ)"
 
 ## Load record instances
 dbLoadTemplate("db/user.substitutions")

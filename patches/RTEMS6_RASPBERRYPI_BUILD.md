@@ -11,6 +11,7 @@ Companion files in this repository:
 | File | Purpose |
 |---|---|
 | `rtems-raspberrypi-irq-dispatch-fix.patch` | **Required.** One-line fix in the RTEMS kernel BSP interrupt dispatcher. Without it the IOC freezes after 30 s to 3 min of USB/network traffic. |
+| `rtems-telnetd-pty-eof-fix.patch` | **Required.** Fix in the RTEMS kernel telnetd pty driver (`cpukit/telnetd/pty.c`, builds `libtelnetd.a`). Without it a telnet session that is closed from the client side (not with `bye`) leaves its pty stuck at end-of-file, and every later telnet connection prints the prompt and is dropped at once until the IOC reboots (2026-10-22). Present in RTEMS 6.2 and in upstream main. |
 | `rtems-kernel-raspberrypi2-config.ini` | The `config.ini` used to build the kernel (POSIX API on, tests on). |
 | `rtems-libbsd-raspberrypi.patch` | **Required.** rtems-libbsd additions for the Pi 3B+: LAN7515/LAN7800 `muge` USB Ethernet driver, nexus wiring, VideoCore USB power-on shim, high-speed UTMI PHY selection, BCM2835 DWC OTG errata workarounds. |
 | `epics-base-R7.0.10-raspberrypi.patch` | **Required.** EPICS base changes (targets, image rules, libbsd NTP time provider with full-resolution NTP sync). See `EPICS_BASE_RASPBERRYPI_PATCH.md`, which also covers adding the PVAccess submodules. |
@@ -87,7 +88,9 @@ git clone https://github.com/RTEMS/rtems.git kernel
 cd kernel && git checkout 6.2
 
 # REQUIRED: interrupt dispatcher fix (see section 9)
-patch -p1 < /path/to/EPICS_APP_RPI3/rtems-raspberrypi-irq-dispatch-fix.patch
+patch -p1 < /path/to/EPICS_APP_RPI3/patches/rtems-raspberrypi-irq-dispatch-fix.patch
+# REQUIRED: telnetd pty end-of-file fix (see section 10, "Telnet")
+patch -p1 < /path/to/EPICS_APP_RPI3/patches/rtems-telnetd-pty-eof-fix.patch
 
 # BSP configuration: either generate and edit ...
 ./waf bspdefaults --rtems-bsps=arm/raspberrypi2 > config.ini
@@ -461,6 +464,25 @@ Expected boot sequence: firmware messages, `RTEMS RPi`, `dwcotg0`,
 watchdog armed (8 s)`, `muge0: Chip ID 0x7800`, `ue0: link state changed
 to UP`, `Early NTP sync with ... OK`, `iocRun: All initialization
 complete`, then the `rtems-pi3>` prompt. Telnet to port 23 also works.
+
+Telnet (2026-10-22): two bugs made the telnet iocsh usable only once per
+boot. (1) RTEMS telnetd's pty driver signals a dropped client connection
+by setting the termios line-buffer index past its count; nothing reset
+it, so the next session on that pty (always the same one, the slot goes
+back to the head of the free list) read end-of-file immediately and was
+closed. Fixed in `patches/rtems-telnetd-pty-eof-fix.patch` (reset in
+`rtems_pty_set_socket()`), part of the kernel build above. (2) EPICS
+base's session handler `telnet_pseudoIocsh()` saved descriptors 1 and 2
+with `dup2(1,1)`, a no-op, so after the first session they stayed on the
+first pty and all later `printf` output from other tasks went to a closed
+socket (the serial console went quiet). Fixed in the base patch (`dup()`
+and `close()` of the saved descriptors). (3) The session task opens
+`stdin`/`stdout`/`stderr` on the pty once and reuses the FILEs for every
+connection; newlib keeps a sticky end-of-file flag on the FILE after
+`fgets()` returned NULL, so the next session read EOF immediately even
+with (1) fixed. The handler now calls `clearerr()` on the three streams
+at the start of each session (also in the base patch). Leaving a session
+with `bye` or by closing the client are now equivalent.
 
 The IOC arms the BCM2835 hardware watchdog (8 s); `var hb_wdog_enable 0`
 in iocsh disarms it before stopping the IOC in a debugger.
