@@ -95,8 +95,9 @@ After changing `*.dbd` files or rebuilding libbsd/kernel/Base:
 `rm -f dbd/rpi3.dbd rpi3App/src/O.Common/rpi3.dbd rpi3App/src/O.*/rpi3_registerRecordDeviceDriver.* bin/RTEMS-raspberrypi2/rpi3* rpi3App/src/O.RTEMS-raspberrypi2/rpi3*`
 before `make` (EPICS does not track those dependencies).
 
-Serial console 115200 8N1 on GPIO 14/15; telnet on port 23; CA and PVA on
-the usual ports.
+Serial console 115200 8N1 on GPIO 14/15; telnet on port 23 (repeated
+sessions need the two telnet fixes listed in `patches/`, see
+`RTEMS6_RASPBERRYPI_BUILD.md` section 10); CA and PVA on the usual ports.
 
 ## Network address: static or DHCP, chosen in `cmdline.txt` (2026-10-15)
 

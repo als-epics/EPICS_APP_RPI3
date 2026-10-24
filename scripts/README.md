@@ -67,9 +67,9 @@ skipped.
 
 | Layer | Pinned upstream | Patch applied by the script | Result |
 |---|---|---|---|
-| RTEMS kernel | be446b02 | `patches/rtems-raspberrypi-irq-dispatch-fix.patch` + `patches/rtems-kernel-raspberrypi2-config.ini` | identical to the tree that built the R03.00 images, apart from compiled-out debug markers |
+| RTEMS kernel | be446b02 | `patches/rtems-raspberrypi-irq-dispatch-fix.patch` + `patches/rtems-telnetd-pty-eof-fix.patch` (telnet reconnect, 2026-10-22) + `patches/rtems-kernel-raspberrypi2-config.ini` | identical to the tree that built the R03.00 images, apart from compiled-out debug markers |
 | rtems-libbsd | c4fc2033 | `patches/rtems-libbsd-raspberrypi.patch` (LAN7800 `muge` driver, DWC OTG nexus, Pi device list) | identical in behaviour to the tested tree: the debug instrumentation patch that tree also carries is compiled out (`RPI_IOC_DEBUG` off) |
-| EPICS base | 5b23dcb46 | `patches/epics-base-R7.0.10-raspberrypi.patch` (includes the NTP fraction fix) | identical for the Pi target; the development tree additionally holds local changes for other boards (mvme/mcp750) and legacy-stack code paths that the Pi build does not compile |
+| EPICS base | 5b23dcb46 | `patches/epics-base-R7.0.10-raspberrypi.patch` (includes the NTP fraction fix and the telnet session fixes of 2026-10-22) | identical for the Pi target; the development tree additionally holds local changes for other boards (mvme/mcp750) and legacy-stack code paths that the Pi build does not compile |
 
 Not applied on purpose: `rtems-libbsd-raspberrypi-debug-instrumentation.patch`
 and `rtems-raspberrypi-irq-dispatch-debug-markers.patch` (hang diagnosis

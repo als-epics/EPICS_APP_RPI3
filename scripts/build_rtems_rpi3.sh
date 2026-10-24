@@ -54,6 +54,7 @@ NETSVC_COMMIT=3381863ccf9f90f801fb16ad524a7fcff1301467   # branch 6, 2025-08-26
 # the commits above are what the IOC was verified with.
 
 KERNEL_PATCH=$PATCH_DIR/rtems-raspberrypi-irq-dispatch-fix.patch
+KERNEL_PATCH2=$PATCH_DIR/rtems-telnetd-pty-eof-fix.patch      # telnetd: reconnect after a dropped client (2026-10-22)
 KERNEL_INI=$PATCH_DIR/rtems-kernel-raspberrypi2-config.ini
 LIBBSD_PATCH=$PATCH_DIR/rtems-libbsd-raspberrypi.patch
 # rtems-addon-packages (git.rtems.org, commit 4f5951a) is no longer online;
@@ -154,7 +155,7 @@ echo "  jobs         : $JOBS"
 [ "$PREPARE_ONLY" = 1 ] && echo "  prepare only : clone + patch, no build"
 [ "$DRY_RUN" = 1 ] && echo "  DRY RUN      : build commands are printed, not run"
 echo
-for f in "$KERNEL_PATCH" "$KERNEL_INI" "$LIBBSD_PATCH" "$TECLA_TAR"; do
+for f in "$KERNEL_PATCH" "$KERNEL_PATCH2" "$KERNEL_INI" "$LIBBSD_PATCH" "$TECLA_TAR"; do
     [ -f "$f" ] || die "missing $f"
 done
 run mkdir -p "$SRC_DIR" "$INSTALL_DIR"
@@ -198,6 +199,8 @@ say "2/5 RTEMS kernel, BSP $RTEMS_CPU/$RTEMS_BSP"
 clone_at "$KERNEL_REPO" "$SRC_DIR/kernel" "$KERNEL_COMMIT"
 apply_patch "$SRC_DIR/kernel" "$KERNEL_PATCH" bsps/arm/raspberrypi/irq/irq.c \
     'ffs(pend & BCM2835_IRQ_BASIC_SPEEDUP_USED_BITS)'
+apply_patch "$SRC_DIR/kernel" "$KERNEL_PATCH2" cpukit/telnetd/pty.c \
+    'pty->ttyp->cindex = 0'
 if [ ! -f "$SRC_DIR/kernel/config.ini" ]; then
     run cp "$KERNEL_INI" "$SRC_DIR/kernel/config.ini"
     echo "  config.ini installed from patches/ (POSIX API on, tests on, 256 MB RAM, FDT copy)"

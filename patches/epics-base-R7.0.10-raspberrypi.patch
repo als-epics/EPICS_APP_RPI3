@@ -197,9 +197,63 @@ diff -ruN a/configure/os/RULES.RTEMS-Image b/configure/os/RULES.RTEMS-Image
 +endif # PROD_IOC
 +endif # RPI_KERNEL_IMG
 diff -ruN a/modules/libcom/RTEMS/posix/rtems_init.c b/modules/libcom/RTEMS/posix/rtems_init.c
---- a/modules/libcom/RTEMS/posix/rtems_init.c	2026-03-05 09:43:14.000000000 -0800
-+++ b/modules/libcom/RTEMS/posix/rtems_init.c	2026-10-14 09:58:23.556047346 -0700
-@@ -1139,7 +1139,7 @@
+--- a/modules/libcom/RTEMS/posix/rtems_init.c	2026-10-22 21:37:19.634077788 -0700
++++ b/modules/libcom/RTEMS/posix/rtems_init.c	2026-10-22 23:01:28.930783030 -0700
+@@ -890,10 +890,28 @@
+ 
+   printf("info:  pty dev name = %s\n", name);
+ 
+-  save_fid[1] = dup2(1,1);
++  /*
++   * The telnetd session task opens stdin/stdout/stderr on its pty once and
++   * reuses them for every connection.  Newlib's stdio keeps a sticky
++   * end-of-file flag on the FILE after fgets() returned NULL at the end of
++   * the previous session, so without this the first read of the next
++   * session returns EOF at once and the session is closed immediately.
++   */
++  clearerr(stdin);
++  clearerr(stdout);
++  clearerr(stderr);
++
++  /*
++   * Save the real descriptors 1 and 2 with dup(); dup2(1,1) is a no-op
++   * that returns 1 without duplicating anything, so the old code never
++   * restored them and left them pointing at the pty of the first session
++   * for the rest of the IOC's life (all later printf output from other
++   * tasks went to a closed socket).
++   */
++  save_fid[1] = dup(1);
+   fid[1] = dup2( fileno(stdout), 1);
+   if (fid[1] == -1 ) printf("Can't dup stdout\n");
+-  save_fid[2] = dup2(2,2);
++  save_fid[2] = dup(2);
+   fid[2] = dup2( fileno(stderr), 2);
+   if (fid[2] == -1 ) printf("Can't dup stderr\n");
+ 
+@@ -902,17 +920,17 @@
+   while (1) {
+     fputs(prompt, stdout);
+     fflush(stdout);
+-    /* telnet close not detected ??? tbd */
++    /* fgets returns NULL when the client closes the connection */
+     if (fgets(line, LINE_SIZE, stdin) == NULL) {
+-      dup2(save_fid[1],1);
+-      dup2(save_fid[2],2);
++      dup2(save_fid[1],1); close(save_fid[1]);
++      dup2(save_fid[2],2); close(save_fid[2]);
+       return;
+     }
+     if (line[strlen(line)-1] == '\n') line[strlen(line)-1] = 0;
+     if (!strncmp( line, "bye",3)) {
+       printf( "%s", "Will end session\n");
+-      dup2(save_fid[1],1);
+-      dup2(save_fid[2],2);
++      dup2(save_fid[1],1); close(save_fid[1]);
++      dup2(save_fid[2],2); close(save_fid[2]);
+       return;
+      }
+      iocshCmd(line);
+@@ -1139,7 +1157,7 @@
          epicsEnvSet("IOC_NAME", hostname);
      }
  
@@ -208,7 +262,7 @@ diff -ruN a/modules/libcom/RTEMS/posix/rtems_init.c b/modules/libcom/RTEMS/posix
          const char *tzp = envGetConfigParamPtr(&EPICS_TZ);
          if (tzp == NULL) {
              printf("Warning -- no timezone information available -- times will be displayed as GMT.\n");
-@@ -1154,9 +1154,9 @@
+@@ -1154,9 +1172,9 @@
       */
  #if __RTEMS_MAJOR__>4
      // if telnetd is requested ...

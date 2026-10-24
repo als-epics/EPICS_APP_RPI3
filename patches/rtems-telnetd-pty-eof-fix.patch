@@ -1,0 +1,23 @@
+diff --git a/cpukit/telnetd/pty.c b/cpukit/telnetd/pty.c
+index 0753a799c1..234f476082 100644
+--- a/cpukit/telnetd/pty.c
++++ b/cpukit/telnetd/pty.c
+@@ -128,6 +128,18 @@ void rtems_pty_set_socket(rtems_pty_context *pty, int socket)
+   rtems_pty_close_socket(pty);
+   pty->socket = socket;
+ 
++  /*
++   * Clear the end-of-file state that ptyPollRead() leaves behind when the
++   * previous client dropped the connection (it sets cindex > ccount so that
++   * termios returns a zero-length read).  The tty itself stays open across
++   * sessions, so without this reset every later session on this pty hits
++   * end-of-file on its first read and is closed immediately.
++   */
++  if (pty->ttyp != NULL) {
++    pty->ttyp->cindex = 0;
++    pty->ttyp->ccount = 0;
++  }
++
+   /* set a long polling interval to save CPU time */
+   t.tv_sec=2;
+   t.tv_usec=00000;

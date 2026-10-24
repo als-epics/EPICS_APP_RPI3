@@ -51,9 +51,18 @@ Modified files
 - `configure/os/CONFIG_SITE.Common.RTEMS` - **site specific, edit after
   applying:** `RTEMS_VERSION = 6`, `RTEMS_BASE = /home/mirek/RTEMS-PI/rtems-6/6`,
   `COMMANDLINE_LIBRARY = LIBTECLA`.
-- `modules/libcom/RTEMS/posix/rtems_init.c` - two fixes: the time-zone
+- `modules/libcom/RTEMS/posix/rtems_init.c` - three fixes: the time-zone
   check tested `getenv("")` instead of `getenv("TZ")`; start `telnetd` on
-  RTEMS 6 (the call was commented out upstream).
+  RTEMS 6 (the call was commented out upstream); the telnet session
+  handler `telnet_pseudoIocsh()` saved descriptors 1 and 2 with
+  `dup2(1,1)`, a no-op, so they were never restored and after the first
+  telnet session every `printf` from other IOC tasks went to the closed
+  pty socket (2026-10-22, now `dup()` plus `close()` of the saved copies);
+  the same handler now calls `clearerr()` on `stdin`/`stdout`/`stderr`
+  at session start, because the telnetd session task reuses those FILEs
+  and newlib's end-of-file flag is sticky, which made every session after
+  the first read EOF immediately. The companion kernel-side fix is
+  `rtems-telnetd-pty-eof-fix.patch`.
 - `modules/libcom/src/osi/os/RTEMS/osdVME.h` - no `<bsp/VME.h>` on
   `aarch64` either (Pi 4).
 
