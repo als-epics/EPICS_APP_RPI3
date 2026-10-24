@@ -653,9 +653,9 @@ record(stringin, "$(IOC):CA_BEAC_TIME") {
   field(PINI, "YES")
 }
 record(stringin, "$(IOC):TIMEZONE") {
-  field(DESC, "EPICS_TIMEZONE")
+  field(DESC, "EPICS_TZ")
   field(DTYP, "IOC epics var")
-  field(INP, "@EPICS_TIMEZONE")
+  field(INP, "@EPICS_TZ")
   field(PINI, "YES")
 }
 record(stringin, "$(IOC):TS_NTP_INET") {
